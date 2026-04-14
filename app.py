@@ -4,6 +4,8 @@ Polymarket Signal Bot — Web Service entry point (Render / HF Spaces).
 FastAPI app listens on PORT from environment.
 Telegram bot runs via asyncio.create_task inside the same event loop as FastAPI.
 """
+from __future__ import annotations
+
 import asyncio
 import os
 from contextlib import asynccontextmanager
