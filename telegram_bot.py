@@ -30,8 +30,14 @@ from crypto_payments import (
 
 # ── Bot / dispatcher ──────────────────────────────────────────────────────────
 
+if not config.BOT_TOKEN:
+    print("=" * 60)
+    print("ERROR: TELEGRAM_TOKEN (or BOT_TOKEN) is not set!")
+    print("  Set it as an environment variable before starting.")
+    print("=" * 60)
+
 bot = Bot(
-    token=config.BOT_TOKEN,
+    token=config.BOT_TOKEN or "INVALID_TOKEN_PLACEHOLDER",
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()

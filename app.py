@@ -1,39 +1,48 @@
 """
 Polymarket Signal Bot — Web Service entry point (Render / HF Spaces).
 
-FastAPI app listens on PORT from environment (Render sets $PORT dynamically).
-Telegram bot runs in a separate thread with its own asyncio event loop.
+FastAPI app listens on PORT from environment.
+Telegram bot runs via asyncio.create_task inside the same event loop as FastAPI.
 """
 import asyncio
 import os
-import threading
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="Polik Bott")
+from fastapi import FastAPI, Request, Response
 
 
-@app.get("/")
-def health():
-    return {"status": "running", "bot": "polik-bott"}
+# ── Token validation ─────────────────────────────────────────────────────────
+_token = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN", "")
+if not _token:
+    print("=" * 60)
+    print("ERROR: TELEGRAM_TOKEN (or BOT_TOKEN) is not set!")
+    print("  Set it as an environment variable before starting.")
+    print("=" * 60)
 
 
-# ── Telegram bot in background thread ─────────────────────────────────────────
+# ── Lifespan: start/stop bot alongside FastAPI ───────────────────────────────
+_bot_task: asyncio.Task | None = None
 
-def _run_bot():
-    """Run the aiogram bot polling loop in a dedicated event loop."""
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    global _bot_task
+
+    if not _token:
+        print("[BOT] Skipping bot start — no TELEGRAM_TOKEN provided.")
+        yield
+        return
+
     from telegram_bot import dp, bot, on_startup, on_shutdown, signal_check_loop
 
-    async def _main():
-        print("=" * 50)
-        print("Polymarket Signal Bot Starting...")
-        print("=" * 50)
+    print("=" * 50)
+    print("Polymarket Signal Bot Starting...")
+    print("=" * 50)
 
-        await on_startup(bot)
+    await on_startup(bot)
 
+    async def _bot_main():
         signal_task = asyncio.create_task(signal_check_loop())
-
         try:
             print("Starting Telegram polling...")
             await dp.start_polling(bot)
@@ -46,17 +55,26 @@ def _run_bot():
             await on_shutdown(bot)
             await bot.session.close()
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_main())
-    except Exception as e:
-        print(f"[BOT ERROR] {e}")
-    finally:
-        loop.close()
+    _bot_task = asyncio.create_task(_bot_main())
+    print("[MAIN] Telegram bot task started")
+
+    yield  # FastAPI is running
+
+    # Shutdown
+    if _bot_task and not _bot_task.done():
+        _bot_task.cancel()
+        try:
+            await _bot_task
+        except asyncio.CancelledError:
+            pass
+    print("[MAIN] Bot stopped")
 
 
-# Start bot thread at import time (uvicorn imports this module once)
-_bot_thread = threading.Thread(target=_run_bot, daemon=True, name="telegram-bot")
-_bot_thread.start()
-print("[MAIN] Telegram bot thread started")
+# ── FastAPI app ──────────────────────────────────────────────────────────────
+app = FastAPI(title="Polik Bott", lifespan=lifespan)
+
+
+@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
+async def health(request: Request):
+    return {"status": "ok"}
