@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: polik-bott
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: METACULUS_API_KEY
+        sync: false
+      - key: CRYPTO_BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: DATABASE_PATH
+        value: /tmp/polymarket_bot.db
+      - key: PORT
+        value: 10000
