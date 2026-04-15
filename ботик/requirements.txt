@@ -1,5 +1,4 @@
 aiogram>=3.7.0,<4.0.0
-web3>=6.0.0
 feedparser>=6.0.10
 requests>=2.31.0
 python-dotenv>=1.0.0
