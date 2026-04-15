@@ -3,9 +3,9 @@ services:
     name: polik-bott
     runtime: docker
     plan: free
+    rootDir: ботик
+    dockerfilePath: ботик/Dockerfile
     healthCheckPath: /health
-    # Render allows up to 300 s for the first health-check after deploy.
-    # With a single-worker uvicorn the bot is ready in < 15 s normally.
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
@@ -23,7 +23,6 @@ services:
         value: /tmp/polymarket_bot.db
       - key: PORT
         value: 10000
-      # Memory-conscious signal filters
       - key: MIN_VOLUME_24H
         value: "1000"
       - key: MAX_SPREAD_PERCENT
