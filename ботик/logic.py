@@ -1,22 +1,32 @@
 """Signal generation logic for Polymarket Bot.
 
-Contains three strategies:
-1. UMA Oracle — monitors near-expiry markets with extreme prices (high certainty signals)
-2. News Analysis — AI (Gemini/Ollama) analyzes RSS news vs active markets
-3. Metaculus Consensus — compares Metaculus community prediction with Polymarket price
+Memory-optimised for Render free tier (512 MB RAM).
 
-All strategies prioritise markets expiring soonest for maximum capital efficiency.
+Key changes vs original:
+- Markets fetched ONCE per cycle and cached (shared across all 3 strategies)
+- Streaming page-by-page filter: raw pages are discarded immediately — never
+  accumulate all raw pages in memory simultaneously
+- Hard cap: keep only top MAX_MARKETS_IN_MEMORY markets after each page
+- web3 / Polygon RPC removed (UMA strategy works purely on prices)
+- Each strategy receives a pre-filtered slice — no second full scan
+
+Three strategies:
+1. UMA Oracle        — near-expiry markets with extreme prices (≥88% / ≤12%)
+2. News Analysis     — AI (Gemini Flash free tier) cross-checks RSS vs markets
+3. Metaculus Consensus — Metaculus community vs Polymarket price divergence
 """
+from __future__ import annotations
+
 import asyncio
 import feedparser
 import os
 import re
 import json as json_module
-import requests
-from web3 import Web3
-from typing import List, Dict, Optional, Any, Tuple
-from dataclasses import dataclass
+import time
+from typing import List, Dict, Optional, Any
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+
 import aiohttp
 
 from config import config
@@ -26,13 +36,12 @@ from config import config
 
 @dataclass
 class Signal:
-    """Represents a trading signal."""
     strategy: str
     market_id: str
     market_name: str
     current_price: float
     expected_outcome: str
-    confidence: float        # 0-100
+    confidence: float
     expected_profit: float
     liquidity_volume_24h: float
     bid_ask_spread: float
@@ -40,141 +49,39 @@ class Signal:
     polymarket_url: str
     timestamp: datetime
     details: Dict[str, Any]
-    end_date: Optional[str] = None   # ISO string — used for soonest-expiry sort
+    end_date: Optional[str] = None
     is_valid: bool = True
 
 
-# ── Full Polymarket market fetcher (paginated — ALL markets) ──────────────────
+# ── Shared market cache ───────────────────────────────────────────────────────
+# Markets are fetched once per signal-generation cycle and reused by all
+# strategies, saving ~2× memory and ~2× network I/O.
 
-async def fetch_all_polymarket_markets() -> List[Dict]:
-    """
-    Fetch ALL active Polymarket markets using pagination.
-    Returns a list of normalised market dicts sorted by days_to_expiry ASC
-    (soonest expiring first) with volume as secondary sort.
-    """
-    PAGE_SIZE = 500
-    all_raw: List[Dict] = []
-    offset = 0
+@dataclass
+class _MarketCache:
+    markets: List[Dict] = field(default_factory=list)
+    fetched_at: float = 0.0          # unix timestamp
+    ttl: float = 120.0               # seconds — refresh no more than once per 2 min
 
-    print("[API] Starting full Polymarket scan (paginated)...")
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=30)
-    ) as session:
-        while True:
-            url = (
-                f"https://gamma-api.polymarket.com/markets"
-                f"?active=true&closed=false&limit={PAGE_SIZE}&offset={offset}"
-            )
-            try:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        print(f"[API ERROR] status {resp.status} at offset {offset}")
-                        break
-                    data = await resp.json()
-            except Exception as e:
-                print(f"[API ERROR] fetch page at offset {offset}: {e}")
-                break
+    def is_fresh(self) -> bool:
+        return bool(self.markets) and (time.monotonic() - self.fetched_at) < self.ttl
 
-            page = data if isinstance(data, list) else data.get("data", [])
-            if not page:
-                break
+    def store(self, markets: List[Dict]):
+        self.markets = markets
+        self.fetched_at = time.monotonic()
 
-            all_raw.extend(page)
-            print(f"[API]   fetched {len(all_raw)} markets so far...")
+    def clear(self):
+        self.markets = []
+        self.fetched_at = 0.0
 
-            if len(page) < PAGE_SIZE:
-                break          # last page
-            offset += PAGE_SIZE
-            await asyncio.sleep(0.1)   # be polite to the API
 
-    print(f"[API] Raw total from Gamma API: {len(all_raw)}")
+_cache = _MarketCache()
 
-    now = datetime.utcnow()
-    markets: List[Dict] = []
-
-    for m in all_raw:
-        if m.get("closed") is True or m.get("archived") is True:
-            continue
-
-        # ── Parse end date ──────────────────────────────────────────────────
-        end_date_str = (
-            m.get("endDate") or m.get("end_date")
-            or m.get("resolution_date") or None
-        )
-        days_to_expiry: Optional[float] = None
-        if end_date_str:
-            try:
-                ed = str(end_date_str).replace("Z", "").replace("+00:00", "")
-                end_dt = datetime.fromisoformat(ed)
-                if end_dt < now:
-                    continue        # already expired
-                days_to_expiry = (end_dt - now).total_seconds() / 86400.0
-            except Exception:
-                pass
-
-        # ── Parse prices ────────────────────────────────────────────────────
-        best_bid = _parse_float(m.get("bestBid"))
-        best_ask = _parse_float(m.get("bestAsk"))
-
-        if best_bid <= 0:
-            raw_prices = m.get("outcomePrices")
-            if isinstance(raw_prices, str):
-                try:
-                    pl = json_module.loads(raw_prices)
-                    if pl:
-                        best_bid = float(pl[0])
-                        if len(pl) > 1 and best_ask <= 0:
-                            best_ask = float(pl[1])
-                except Exception:
-                    pass
-            elif isinstance(raw_prices, list) and raw_prices:
-                try:
-                    best_bid = float(raw_prices[0])
-                    if len(raw_prices) > 1 and best_ask <= 0:
-                        best_ask = float(raw_prices[1])
-                except Exception:
-                    pass
-
-        if best_bid <= 0 and best_ask <= 0:
-            continue
-
-        volume = _parse_float(m.get("volume24h") or m.get("volume") or 0)
-        spread_pct = 0.0
-        if best_ask > best_bid > 0:
-            spread_pct = ((best_ask - best_bid) / best_bid) * 100
-
-        market_id = (
-            m.get("market_slug") or m.get("slug")
-            or m.get("conditionId") or ""
-        )
-        if not market_id:
-            continue
-
-        markets.append({
-            "id": market_id,
-            "slug": market_id,
-            "condition_id": m.get("conditionId", ""),
-            "name": m.get("question") or m.get("title") or "",
-            "description": m.get("description", ""),
-            "category": m.get("category", "General"),
-            "volume_24h": volume,
-            "best_bid": best_bid if best_bid > 0 else best_ask,
-            "best_ask": best_ask if best_ask > 0 else best_bid,
-            "spread_pct": spread_pct,
-            "end_date": end_date_str,
-            "days_to_expiry": days_to_expiry,
-            "uma_request_id": m.get("uma_request_id") or m.get("umaRequestId"),
-        })
-
-    # Primary sort: soonest expiry first; secondary: volume descending
-    markets.sort(
-        key=lambda x: (
-            x["days_to_expiry"] if x["days_to_expiry"] is not None else 9999,
-            -x["volume_24h"]
-        )
-    )
-    print(f"[API] After filtering: {len(markets)} active tradeable markets")
-    return markets
+# Maximum number of market dicts kept in memory at once.
+# Each dict is ~400 bytes → 1 000 markets ≈ 0.4 MB.  Very safe for 512 MB.
+MAX_MARKETS_IN_MEMORY = 1_000
+# How many pages to fetch (PAGE_SIZE=100 → 1 000 markets max)
+PAGE_SIZE = 100
 
 
 def _parse_float(val) -> float:
@@ -186,88 +93,210 @@ def _parse_float(val) -> float:
         return 0.0
 
 
+# ── Memory-efficient market fetcher ──────────────────────────────────────────
+
+async def fetch_polymarket_markets(force: bool = False) -> List[Dict]:
+    """
+    Fetch active Polymarket markets.
+
+    • Returns the cached list if it is still fresh (< 2 min old).
+    • Otherwise fetches page-by-page, filters on the fly, and keeps only
+      the top MAX_MARKETS_IN_MEMORY markets — raw page data is discarded
+      immediately so peak RAM is O(page_size), not O(all_markets).
+    • Markets are sorted: soonest expiry first, then volume descending.
+    """
+    if not force and _cache.is_fresh():
+        return _cache.markets
+
+    now = datetime.utcnow()
+    kept: List[Dict] = []
+    offset = 0
+    total_raw = 0
+
+    print("[API] Fetching Polymarket markets (memory-efficient mode)...")
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    connector = aiohttp.TCPConnector(limit=4)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            while len(kept) < MAX_MARKETS_IN_MEMORY:
+                url = (
+                    f"https://gamma-api.polymarket.com/markets"
+                    f"?active=true&closed=false&limit={PAGE_SIZE}&offset={offset}"
+                )
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            print(f"[API ERROR] status={resp.status} offset={offset}")
+                            break
+                        data = await resp.json()
+                except Exception as e:
+                    print(f"[API ERROR] page offset={offset}: {e}")
+                    break
+
+                page: List[Dict] = data if isinstance(data, list) else data.get("data", [])
+                if not page:
+                    break
+
+                total_raw += len(page)
+
+                # ── Filter & normalise this page in place ──────────────────
+                for m in page:
+                    if m.get("closed") or m.get("archived"):
+                        continue
+
+                    # Parse end date
+                    end_date_str = (
+                        m.get("endDate") or m.get("end_date")
+                        or m.get("resolution_date")
+                    )
+                    days_to_expiry: Optional[float] = None
+                    if end_date_str:
+                        try:
+                            ed = str(end_date_str).replace("Z", "").replace("+00:00", "")
+                            end_dt = datetime.fromisoformat(ed)
+                            if end_dt < now:
+                                continue   # already expired
+                            days_to_expiry = (end_dt - now).total_seconds() / 86400.0
+                        except Exception:
+                            pass
+
+                    # Parse prices
+                    best_bid = _parse_float(m.get("bestBid"))
+                    best_ask = _parse_float(m.get("bestAsk"))
+
+                    if best_bid <= 0:
+                        raw_prices = m.get("outcomePrices")
+                        if isinstance(raw_prices, str):
+                            try:
+                                pl = json_module.loads(raw_prices)
+                                if pl:
+                                    best_bid = float(pl[0])
+                                    if len(pl) > 1 and best_ask <= 0:
+                                        best_ask = float(pl[1])
+                            except Exception:
+                                pass
+                        elif isinstance(raw_prices, list) and raw_prices:
+                            try:
+                                best_bid = float(raw_prices[0])
+                                if len(raw_prices) > 1 and best_ask <= 0:
+                                    best_ask = float(raw_prices[1])
+                            except Exception:
+                                pass
+
+                    if best_bid <= 0 and best_ask <= 0:
+                        continue
+
+                    price = best_bid if best_bid > 0 else best_ask
+                    ask   = best_ask if best_ask > 0 else price
+
+                    volume = _parse_float(
+                        m.get("volume24h") or m.get("volume") or 0
+                    )
+                    spread_pct = (
+                        ((ask - price) / price * 100) if ask > price > 0 else 0.0
+                    )
+
+                    market_id = (
+                        m.get("market_slug") or m.get("slug")
+                        or m.get("conditionId") or ""
+                    )
+                    if not market_id:
+                        continue
+
+                    # ── Store only what strategies actually need ────────────
+                    # (~10 fields vs ~40+ raw) — saves ~75% per-market memory
+                    kept.append({
+                        "id":            market_id,
+                        "slug":          market_id,
+                        "name":          (m.get("question") or m.get("title") or "")[:200],
+                        "description":   (m.get("description") or "")[:300],
+                        "category":      m.get("category", "General"),
+                        "volume_24h":    volume,
+                        "best_bid":      price,
+                        "best_ask":      ask,
+                        "spread_pct":    spread_pct,
+                        "end_date":      end_date_str,
+                        "days_to_expiry": days_to_expiry,
+                    })
+
+                # Discard raw page immediately
+                del page, data
+
+                print(f"[API]   raw={total_raw} | kept={len(kept)}")
+
+                if len(kept) >= MAX_MARKETS_IN_MEMORY:
+                    break
+                if len(page if False else []) < PAGE_SIZE:  # checked via total_raw delta
+                    pass
+                # Stop if last page was smaller than PAGE_SIZE
+                if total_raw % PAGE_SIZE != 0 and total_raw > 0:
+                    break
+
+                offset += PAGE_SIZE
+                await asyncio.sleep(0.05)
+    except Exception as e:
+        print(f"[API] Unexpected error: {e}")
+
+    # Sort: soonest expiry first, then volume desc
+    kept.sort(key=lambda x: (
+        x["days_to_expiry"] if x["days_to_expiry"] is not None else 9999.0,
+        -x["volume_24h"],
+    ))
+
+    print(f"[API] Done. {len(kept)} markets in cache (raw fetched: {total_raw})")
+    _cache.store(kept)
+    return kept
+
+
 # ── Liquidity filter ──────────────────────────────────────────────────────────
 
 class LiquidityFilter:
     @staticmethod
     def check(market: Dict) -> Optional[Dict]:
-        bid = market.get("best_bid", 0)
-        ask = market.get("best_ask", 0)
-        volume = market.get("volume_24h", 0)
-        spread = market.get("spread_pct", 0)
-
+        bid = market.get("best_bid", 0.0)
+        ask = market.get("best_ask", 0.0)
         if bid <= 0 and ask <= 0:
             return None
         price = bid if bid > 0 else ask
-
         return {
-            "volume_24h": volume,
-            "best_bid": price,
-            "best_ask": ask if ask > 0 else price,
-            "spread_pct": spread,
+            "volume_24h": market.get("volume_24h", 0.0),
+            "best_bid":   price,
+            "best_ask":   ask if ask > 0 else price,
+            "spread_pct": market.get("spread_pct", 0.0),
         }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STRATEGY 1: UMA Oracle
-# Logic: markets expiring within 3 days with price ≥ 0.88 or ≤ 0.12 have
-# near-certain outcomes that the UMA oracle is about to confirm.
-# Winrate driver: extreme prices near expiry are almost never wrong.
+# Near-expiry markets with extreme prices → almost-certain outcome signals.
+# Expected winrate: ~90 %+
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class UMAOracleStrategy:
-    """
-    Finds markets expiring in ≤ 3 days with YES price ≥ 0.88 or ≤ 0.12.
-    These are effectively resolved — UMA will confirm within hours.
-    Expected winrate: ~90%+
-    """
-
-    EXPIRY_DAYS_MAX = 3          # Only look at near-term markets
-    PRICE_HIGH_THRESHOLD = 0.88  # YES ≥ 88% → strong YES signal
-    PRICE_LOW_THRESHOLD  = 0.12  # YES ≤ 12% → strong NO signal
-    MIN_VOLUME = 500             # Lower bar — near-expiry markets have less daily vol
-
-    def __init__(self):
-        self.w3: Optional[Web3] = None
-        self._connect_rpc()
-
-    def _connect_rpc(self):
-        for url in config.POLYGON_RPC_URLS:
-            try:
-                w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
-                if w3.is_connected():
-                    self.w3 = w3
-                    print(f"[✅ UMA] Connected to Polygon RPC: {url}")
-                    return
-            except Exception as e:
-                print(f"[UMA] RPC {url} unavailable: {e}")
-        # RPC is optional — all UMA price-based signals work without it
-        print("[✅ UMA] Running in price-oracle mode (no RPC required — all signals active)")
+    EXPIRY_DAYS_MAX    = 3
+    PRICE_HIGH         = 0.88
+    PRICE_LOW          = 0.12
+    MIN_VOLUME         = 500
 
     async def get_signals(self) -> List[Signal]:
         signals: List[Signal] = []
         print("\n[🔮 UMA] Starting scan...")
 
         try:
-            all_markets = await fetch_all_polymarket_markets()
-            if not all_markets:
-                print("[🔮 UMA] No markets available")
-                return signals
-
-            # Filter: expiring within EXPIRY_DAYS_MAX days
+            all_markets = await fetch_polymarket_markets()
             near_expiry = [
                 m for m in all_markets
                 if m.get("days_to_expiry") is not None
                 and 0 < m["days_to_expiry"] <= self.EXPIRY_DAYS_MAX
             ]
-            print(f"[🔮 UMA] Markets expiring in ≤{self.EXPIRY_DAYS_MAX} days: {len(near_expiry)}")
+            print(f"[🔮 UMA] Near-expiry markets: {len(near_expiry)}")
 
-            # Soonest first (already sorted by fetch_all)
             for market in near_expiry:
                 liq = LiquidityFilter.check(market)
                 if not liq:
                     continue
-
                 volume = liq["volume_24h"]
                 price  = liq["best_bid"]
                 days   = market["days_to_expiry"]
@@ -277,45 +306,32 @@ class UMAOracleStrategy:
                 if liq["spread_pct"] > config.MAX_SPREAD_PERCENT:
                     continue
 
-                name = market["name"]
-                print(f"[🔮 UMA] {name[:55]} | price={price:.2%} | days={days:.1f} | vol=${volume:,.0f}")
-
-                if price >= self.PRICE_HIGH_THRESHOLD:
-                    expected_outcome = "YES"
-                    # Higher confidence for prices closer to 1
-                    raw_conf = 75 + (price - self.PRICE_HIGH_THRESHOLD) / (1 - self.PRICE_HIGH_THRESHOLD) * 20
-                    confidence = min(raw_conf, 95)
-                    expected_profit = (1.0 - price) * 100
-
-                elif price <= self.PRICE_LOW_THRESHOLD:
-                    expected_outcome = "NO"
-                    raw_conf = 75 + (self.PRICE_LOW_THRESHOLD - price) / self.PRICE_LOW_THRESHOLD * 20
-                    confidence = min(raw_conf, 95)
-                    expected_profit = price * 100   # buying NO at (1-price)
-
+                if price >= self.PRICE_HIGH:
+                    outcome       = "YES"
+                    raw_conf      = 75 + (price - self.PRICE_HIGH) / (1 - self.PRICE_HIGH) * 20
+                    confidence    = min(raw_conf, 95)
+                    exp_profit    = (1.0 - price) * 100
+                elif price <= self.PRICE_LOW:
+                    outcome       = "NO"
+                    raw_conf      = 75 + (self.PRICE_LOW - price) / self.PRICE_LOW * 20
+                    confidence    = min(raw_conf, 95)
+                    exp_profit    = price * 100
                 else:
-                    continue  # price in uncertain middle zone
+                    continue
 
-                # Extra confidence boost for very soon expiry
                 if days <= 1:
                     confidence = min(confidence + 5, 97)
-
-                if expected_profit < config.MIN_PROFIT_PERCENT:
+                if confidence < 78 or exp_profit < config.MIN_PROFIT_PERCENT:
                     continue
 
-                # Safety: skip if confidence is not meaningfully above 75%
-                # (low confidence on extreme price = false signal risk)
-                if confidence < 78:
-                    continue
-
-                sig = Signal(
+                signals.append(Signal(
                     strategy="🔮 UMA Оракул",
                     market_id=market["id"],
-                    market_name=name,
+                    market_name=market["name"],
                     current_price=price,
-                    expected_outcome=expected_outcome,
+                    expected_outcome=outcome,
                     confidence=round(confidence, 1),
-                    expected_profit=round(expected_profit, 2),
+                    expected_profit=round(exp_profit, 2),
                     liquidity_volume_24h=volume,
                     bid_ask_spread=liq["spread_pct"],
                     source_url="",
@@ -324,40 +340,28 @@ class UMAOracleStrategy:
                     end_date=market.get("end_date"),
                     details={
                         "days_to_expiry": round(days, 2),
-                        "price_signal": f"Near-expiry {expected_outcome} @ {price:.2%}",
-                        "category": market.get("category", "General"),
-                        "on_chain_rpc": self.w3 is not None,
+                        "price_signal":   f"Near-expiry {outcome} @ {price:.2%}",
+                        "category":       market.get("category", "General"),
                     }
-                )
-                signals.append(sig)
-                print(f"[🔮 UMA]   ✅ SIGNAL | outcome={expected_outcome} | conf={confidence:.1f}%")
+                ))
+                print(f"[🔮 UMA] ✅ {market['name'][:50]} | {outcome} | conf={confidence:.1f}%")
 
         except Exception as e:
             print(f"[🔮 UMA ERROR] {e}")
-            import traceback; traceback.print_exc()
 
-        # Sort: soonest expiry → highest confidence
         signals.sort(key=lambda s: (
-            _days_sort_key(s.details.get("days_to_expiry")),
-            -s.confidence
+            _days_key(s.details.get("days_to_expiry")),
+            -s.confidence,
         ))
         print(f"[🔮 UMA] Done. {len(signals)} signals\n")
         return signals
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STRATEGY 2: News Analysis via Gemini API (or Ollama fallback)
-# Logic: scrape RSS headlines, ask AI if they confirm a Polymarket market
-# outcome, filter by high confidence only.
+# STRATEGY 2: News Analysis via Gemini Flash (free tier)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class NewsStrategy:
-    """
-    AI-powered news analysis.
-    Primary: Google Gemini Flash (free tier via REST — no SDK needed)
-    Fallback: local Ollama model
-    """
-
     RSS_FEEDS = [
         "https://feeds.reuters.com/reuters/businessnews",
         "https://news.google.com/rss/search?q=prediction+market+polymarket",
@@ -367,59 +371,37 @@ class NewsStrategy:
         "https://news.google.com/rss/search?q=sports+championship+winner",
         "https://news.google.com/rss/search?q=geopolitics+war+ceasefire",
     ]
-
-    GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    OLLAMA_MODELS   = ["llama3.2", "qwen2.5", "mistral", "phi3"]
-    OLLAMA_HOST     = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-
-    MIN_NEWS_CONFIDENCE = 72   # Only high-confidence AI calls pass
+    GEMINI_ENDPOINT  = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-1.5-flash:generateContent"
+    )
+    MIN_CONFIDENCE   = 72
+    # How many tradeable markets to analyse — keep low to save memory & API quota
+    ANALYSE_TOP_N    = 30
 
     def __init__(self):
-        self.gemini_key   = os.getenv("GEMINI_API_KEY", "")
-        self.ollama_model: Optional[str] = None
-        self._init_ollama()
-
-    def _init_ollama(self):
-        try:
-            resp = requests.get(f"{self.OLLAMA_HOST}/api/tags", timeout=5)
-            if resp.status_code != 200:
-                return
-            models_data = resp.json().get("models", [])
-            available   = [m["name"] for m in models_data]
-            for pref in self.OLLAMA_MODELS:
-                for full in available:
-                    if pref in full:
-                        self.ollama_model = full
-                        print(f"[📰 NEWS] Ollama model: {full}")
-                        return
-            if available:
-                self.ollama_model = available[0]
-                print(f"[📰 NEWS] Ollama fallback model: {self.ollama_model}")
-        except Exception:
-            pass
+        self.gemini_key = os.getenv("GEMINI_API_KEY", "")
 
     @property
     def has_ai(self) -> bool:
-        return bool(self.gemini_key) or bool(self.ollama_model)
+        return bool(self.gemini_key)
 
     async def get_signals(self) -> List[Signal]:
         signals: List[Signal] = []
         print("\n[📰 NEWS] Starting news analysis...")
 
         if not self.has_ai:
-            print("[📰 NEWS] No AI backend available (set GEMINI_API_KEY or start Ollama)")
+            print("[📰 NEWS] No GEMINI_API_KEY — skipping news strategy")
             return signals
 
         headlines = await self._fetch_headlines()
-        print(f"[📰 NEWS] Fetched {len(headlines)} headlines")
+        print(f"[📰 NEWS] Headlines fetched: {len(headlines)}")
         if not headlines:
             return signals
 
-        all_markets = await fetch_all_polymarket_markets()
-        if not all_markets:
-            return signals
+        all_markets = await fetch_polymarket_markets()
 
-        # Pre-filter for liquidity — check soonest expiry first
+        # Build tradeable slice (generator → no extra list copy)
         tradeable: List[Dict] = []
         for m in all_markets:
             liq = LiquidityFilter.check(m)
@@ -431,12 +413,13 @@ class NewsStrategy:
                 continue
             m["_liq"] = liq
             tradeable.append(m)
+            if len(tradeable) >= self.ANALYSE_TOP_N:
+                break
 
-        print(f"[📰 NEWS] Tradeable markets: {len(tradeable)} — analysing top 40 (soonest expiry)")
+        print(f"[📰 NEWS] Analysing top {len(tradeable)} markets...")
 
-        # Analyse top-40 soonest-expiry tradeable markets
-        for i, market in enumerate(tradeable[:40]):
-            print(f"[📰 NEWS] [{i+1}/40] {market['name'][:55]}")
+        for i, market in enumerate(tradeable):
+            print(f"[📰 NEWS] [{i+1}/{len(tradeable)}] {market['name'][:55]}")
             liq   = market["_liq"]
             price = liq["best_bid"]
 
@@ -445,20 +428,16 @@ class NewsStrategy:
                 continue
 
             conf = analysis["confidence"]
-            if conf < self.MIN_NEWS_CONFIDENCE:
-                print(f"[📰 NEWS]   ❌ confidence too low ({conf:.0f}%)")
+            if conf < self.MIN_CONFIDENCE:
                 continue
 
-            outcome = analysis["expected_outcome"]
-            if outcome == "YES":
-                exp_profit = (1.0 - price) * 100
-            else:
-                exp_profit = price * 100
+            outcome    = analysis["expected_outcome"]
+            exp_profit = (1.0 - price) * 100 if outcome == "YES" else price * 100
 
             if exp_profit < config.MIN_PROFIT_PERCENT:
                 continue
 
-            sig = Signal(
+            signals.append(Signal(
                 strategy="📰 Новостной Анализ",
                 market_id=market["id"],
                 market_name=market["name"],
@@ -476,17 +455,16 @@ class NewsStrategy:
                     "relevant_headlines": analysis.get("relevant_headlines", []),
                     "analysis_summary":   analysis.get("summary", ""),
                 }
-            )
-            signals.append(sig)
-            print(f"[📰 NEWS]   ✅ SIGNAL | {outcome} | conf={conf:.0f}%")
+            ))
+            print(f"[📰 NEWS] ✅ {outcome} | conf={conf:.0f}%")
 
             if len(signals) >= 8:
                 break
 
-        signals.sort(key=lambda s: (
-            _days_sort_key_str(s.end_date),
-            -s.confidence
-        ))
+            # Small delay to avoid hammering Gemini free-tier rate limits
+            await asyncio.sleep(0.5)
+
+        signals.sort(key=lambda s: (_days_key_str(s.end_date), -s.confidence))
         print(f"[📰 NEWS] Done. {len(signals)} signals\n")
         return signals
 
@@ -495,27 +473,26 @@ class NewsStrategy:
         for url in self.RSS_FEEDS:
             try:
                 feed = await asyncio.to_thread(feedparser.parse, url)
-                for entry in feed.entries[:10]:
+                for entry in feed.entries[:8]:
                     title = entry.get("title", "").strip()
                     if title:
                         headlines.append({
-                            "title":     title,
-                            "summary":   entry.get("summary", "")[:300],
-                            "link":      entry.get("link", ""),
-                            "source":    feed.feed.get("title", "Unknown"),
+                            "title":   title,
+                            "summary": entry.get("summary", "")[:200],
+                            "link":    entry.get("link", ""),
+                            "source":  feed.feed.get("title", "Unknown"),
                         })
             except Exception as e:
                 print(f"[📰 NEWS] Feed error {url}: {e}")
         return headlines
 
     async def _analyze(self, market: Dict, headlines: List[Dict]) -> Optional[Dict]:
-        """Call AI (Gemini first, then Ollama) to analyse headline relevance."""
-        price = market.get("_liq", {}).get("best_bid", 0.5)
+        price    = market.get("_liq", {}).get("best_bid", 0.5)
         question = market["name"]
 
         hl_text = "\n".join(
             f"{i+1}. [{h['source']}] {h['title']}"
-            for i, h in enumerate(headlines[:25])
+            for i, h in enumerate(headlines[:20])
         )
 
         prompt = f"""You are a professional prediction market analyst.
@@ -540,18 +517,9 @@ CONFIDENCE: number
 HEADLINES: numbers
 SUMMARY: explanation"""
 
-        # Try Gemini first
-        if self.gemini_key:
-            result = await self._call_gemini(prompt)
-            if result:
-                return self._parse_analysis(result, headlines)
-
-        # Fallback: Ollama
-        if self.ollama_model:
-            result = await self._call_ollama(prompt)
-            if result:
-                return self._parse_analysis(result, headlines)
-
+        result = await self._call_gemini(prompt)
+        if result:
+            return self._parse_analysis(result, headlines)
         return None
 
     async def _call_gemini(self, prompt: str) -> Optional[str]:
@@ -564,412 +532,258 @@ SUMMARY: explanation"""
                 async with session.post(url, json=body) as resp:
                     if resp.status != 200:
                         text = await resp.text()
-                        print(f"[📰 NEWS] Gemini error {resp.status}: {text[:200]}")
+                        print(f"[📰 NEWS] Gemini {resp.status}: {text[:150]}")
                         return None
                     data = await resp.json()
                     return (
                         data.get("candidates", [{}])[0]
-                           .get("content", {})
-                           .get("parts", [{}])[0]
-                           .get("text", "")
+                            .get("content", {})
+                            .get("parts", [{}])[0]
+                            .get("text", "")
                     )
         except Exception as e:
-            print(f"[📰 NEWS] Gemini call error: {e}")
+            print(f"[📰 NEWS] Gemini error: {e}")
             return None
 
-    async def _call_ollama(self, prompt: str) -> Optional[str]:
+    def _parse_analysis(self, text: str, headlines: List[Dict]) -> Optional[Dict]:
         try:
-            payload = {
-                "model":  self.ollama_model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.2, "num_predict": 200},
+            lines = {
+                k.strip(): v.strip()
+                for k, _, v in (
+                    line.partition(":")
+                    for line in text.strip().splitlines()
+                    if ":" in line
+                )
             }
-            resp = await asyncio.to_thread(
-                requests.post,
-                f"{self.OLLAMA_HOST}/api/generate",
-                json=payload,
-                timeout=90,
-            )
-            if resp.status_code != 200:
+            if lines.get("RELEVANT", "NO").upper() != "YES":
                 return None
-            await asyncio.sleep(1.5)
-            return resp.json().get("response", "")
-        except Exception as e:
-            print(f"[📰 NEWS] Ollama error: {e}")
-            return None
 
-    @staticmethod
-    def _parse_analysis(text: str, headlines: List[Dict]) -> Optional[Dict]:
-        lines = {}
-        for line in text.split("\n"):
-            if ":" in line:
-                k, _, v = line.partition(":")
-                lines[k.strip().upper()] = v.strip()
+            outcome    = lines.get("OUTCOME", "").upper()
+            if outcome not in ("YES", "NO"):
+                return None
 
-        if lines.get("RELEVANT", "NO").upper() != "YES":
-            return None
+            conf_str   = re.findall(r"[\d.]+", lines.get("CONFIDENCE", "0"))
+            confidence = float(conf_str[0]) if conf_str else 0.0
 
-        outcome = lines.get("OUTCOME", "YES").upper()
-        if outcome not in ("YES", "NO"):
-            outcome = "YES"
-
-        try:
-            confidence = float(re.findall(r"[\d.]+", lines.get("CONFIDENCE", "0"))[0])
-            confidence = max(0, min(100, confidence))
-        except Exception:
-            confidence = 0
-
-        # Gather relevant headline links
-        hl_nums: List[int] = []
-        try:
-            hl_nums = [
-                int(x.strip()) - 1
-                for x in lines.get("HEADLINES", "").split(",")
-                if x.strip().isdigit()
+            hl_nums    = [
+                int(n) - 1
+                for n in re.findall(r"\d+", lines.get("HEADLINES", ""))
             ]
-        except Exception:
-            pass
+            relevant_hl = [
+                headlines[i]["title"]
+                for i in hl_nums
+                if 0 <= i < len(headlines)
+            ]
+            source_url = headlines[hl_nums[0]]["link"] if hl_nums and hl_nums[0] < len(headlines) else ""
 
-        source_url    = ""
-        relevant_titles: List[str] = []
-        for idx in hl_nums:
-            if 0 <= idx < len(headlines):
-                relevant_titles.append(headlines[idx]["title"])
-                if not source_url:
-                    source_url = headlines[idx]["link"]
-
-        return {
-            "is_relevant":       True,
-            "expected_outcome":  outcome,
-            "confidence":        confidence,
-            "relevant_headlines": relevant_titles,
-            "summary":           lines.get("SUMMARY", ""),
-            "source_url":        source_url,
-        }
+            return {
+                "expected_outcome":   outcome,
+                "confidence":         confidence,
+                "relevant_headlines": relevant_hl,
+                "source_url":         source_url,
+                "summary":            lines.get("SUMMARY", ""),
+            }
+        except Exception as e:
+            print(f"[📰 NEWS] Parse error: {e}")
+            return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STRATEGY 3: Metaculus Real API + Polymarket Price Divergence
-# Logic: query Metaculus v4 for questions with community predictions,
-# find Polymarket markets that match, compare probabilities.
-# Winrate driver: Metaculus superforecasters beat market 60%+ of the time.
+# STRATEGY 3: Metaculus Consensus
+# Compare Metaculus community probability vs Polymarket price.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class MetaculusStrategy:
-    """
-    Fetches real Metaculus questions via the v4 API.
-    Matches them to Polymarket markets by keyword similarity.
-    Large probability divergence (>12%) = trading opportunity.
-    Fallback: if Metaculus API unavailable, uses Gemini/Ollama expert estimate.
-    """
+    METACULUS_API   = "https://www.metaculus.com/api2/questions/"
+    MIN_FORECASTERS = 10
+    MIN_DIVERGENCE  = 0.15
+    ANALYSE_TOP_N   = 60     # markets to check against Metaculus
+    AI_FALLBACK_N   = 20     # markets for AI-expert fallback
 
-    METACULUS_API_BASE = "https://www.metaculus.com/api2"
-    MIN_DIVERGENCE     = 0.10    # 10% gap between Metaculus & Polymarket
-    MIN_FORECASTERS    = 3       # Minimum forecasters for a valid signal
-
-    # Gemini / Ollama same as NewsStrategy
-    OLLAMA_MODELS = ["llama3.2", "qwen2.5", "mistral", "phi3"]
-    OLLAMA_HOST   = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    GEMINI_ENDPOINT = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-1.5-flash:generateContent"
+    )
 
     def __init__(self):
-        self.gemini_key   = os.getenv("GEMINI_API_KEY", "")
         self.metaculus_key = config.METACULUS_API_KEY
-        self.ollama_model: Optional[str] = None
-        self._init_ollama()
-
-    def _init_ollama(self):
-        try:
-            resp = requests.get(f"{self.OLLAMA_HOST}/api/tags", timeout=5)
-            if resp.status_code != 200:
-                return
-            models_data = resp.json().get("models", [])
-            available   = [m["name"] for m in models_data]
-            for pref in self.OLLAMA_MODELS:
-                for full in available:
-                    if pref in full:
-                        self.ollama_model = full
-                        print(f"[🎯 META] Ollama model: {full}")
-                        return
-            if available:
-                self.ollama_model = available[0]
-        except Exception:
-            pass
+        self.gemini_key    = os.getenv("GEMINI_API_KEY", "")
 
     async def get_signals(self) -> List[Signal]:
         signals: List[Signal] = []
-        print("\n[🎯 META] Starting Metaculus consensus analysis...")
+        print("\n[🎯 META] Starting Metaculus scan...")
 
-        try:
-            all_markets = await fetch_all_polymarket_markets()
-            if not all_markets:
-                return signals
+        all_markets = await fetch_polymarket_markets()
+        tradeable   = self._filter_tradeable(all_markets, self.ANALYSE_TOP_N)
+        print(f"[🎯 META] Tradeable slice: {len(tradeable)}")
 
-            # Pre-filter tradeable markets (soonest expiry first)
-            tradeable: List[Dict] = []
-            for m in all_markets:
-                liq = LiquidityFilter.check(m)
-                if not liq:
-                    continue
-                if liq["volume_24h"] < config.MIN_VOLUME_24H:
-                    continue
-                if liq["spread_pct"] > config.MAX_SPREAD_PERCENT:
-                    continue
-                # Skip markets priced near 0 or 1 — already efficient
-                # Also skip extreme prices where risk/reward is hard to judge
-                price = liq["best_bid"]
-                if price < 0.10 or price > 0.90:
-                    continue
-                m["_liq"] = liq
-                tradeable.append(m)
+        meta_signals = await self._match_metaculus(tradeable)
+        signals.extend(meta_signals)
+        print(f"[🎯 META] Metaculus matches: {len(meta_signals)}")
 
-            print(f"[🎯 META] Tradeable (price 8-92%): {len(tradeable)}")
+        # AI fallback when Metaculus coverage is thin
+        if len(signals) < 3 and self.gemini_key:
+            ai_signals = await self._ai_expert_signals(tradeable, signals)
+            signals.extend(ai_signals)
+            print(f"[🎯 META] AI fallback added: {len(ai_signals)}")
 
-            # Try real Metaculus API first
-            metaculus_qs = await self._fetch_metaculus_questions()
-            print(f"[🎯 META] Metaculus questions fetched: {len(metaculus_qs)}")
-
-            if metaculus_qs:
-                signals = await self._match_with_metaculus(tradeable, metaculus_qs)
-
-            # AI fallback: если Metaculus не дал достаточно сигналов — используем AI эксперта
-            if len(signals) < 3 and (self.gemini_key or self.ollama_model):
-                print(f"[🎯 META] Only {len(signals)} signals from Metaculus, trying AI expert fallback...")
-                ai_signals = await self._ai_expert_signals(tradeable, signals)
-                signals.extend(ai_signals)
-                print(f"[🎯 META] AI expert added {len(ai_signals)} signals")
-
-        except Exception as e:
-            print(f"[🎯 META ERROR] {e}")
-            import traceback; traceback.print_exc()
-
-        # Sort soonest expiry first
-        signals.sort(key=lambda s: (
-            _days_sort_key_str(s.end_date),
-            -s.confidence
-        ))
+        signals.sort(key=lambda s: (_days_key_str(s.end_date), -s.confidence))
         print(f"[🎯 META] Done. {len(signals)} signals\n")
         return signals
 
-    async def _fetch_metaculus_questions(self) -> List[Dict]:
-        """Fetch open binary questions from Metaculus with community predictions.
-        Tries both v4 (new) and v2 (legacy) API formats."""
-        questions: List[Dict] = []
-        headers = {"Accept": "application/json"}
-        if self.metaculus_key:
-            headers["Authorization"] = f"Token {self.metaculus_key}"
-
-        # Try Metaculus v4 API (posts/questions endpoint)
-        v4_params = {
-            "statuses": "open",
-            "forecast_type": "binary",
-            "limit": 200,
-            "order_by": "-activity",
-            "has_community_prediction": "true",
-        }
-        # Also try v2 legacy params
-        v2_params = {
-            "status": "open",
-            "type": "forecast",
-            "limit": 200,
-            "order_by": "-activity",
-        }
-
-        for api_url, params in [
-            ("https://www.metaculus.com/api/posts/", v4_params),
-            (f"{self.METACULUS_API_BASE}/questions/", v2_params),
-        ]:
-            if questions:
+    def _filter_tradeable(self, all_markets: List[Dict], limit: int) -> List[Dict]:
+        result: List[Dict] = []
+        for m in all_markets:
+            liq = LiquidityFilter.check(m)
+            if not liq:
+                continue
+            if liq["volume_24h"] < config.MIN_VOLUME_24H:
+                continue
+            if liq["spread_pct"] > config.MAX_SPREAD_PERCENT:
+                continue
+            m["_liq"] = liq
+            result.append(m)
+            if len(result) >= limit:
                 break
-            try:
-                async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=25),
-                    headers=headers,
-                ) as session:
-                    async with session.get(api_url, params=params) as resp:
-                        if resp.status not in (200, 201):
-                            print(f"[🎯 META] {api_url} → status {resp.status}")
-                            continue
-                        data = await resp.json()
-                        results = data.get("results", data if isinstance(data, list) else [])
-                        print(f"[🎯 META] API returned {len(results)} results from {api_url}")
+        return result
 
-                        for q in results:
-                            # Handle v4 structure: question nested inside post
-                            question_data = q.get("question", q)
-                            title = question_data.get("title") or q.get("title", "")
-                            if not title:
-                                continue
-
-                            q_type = question_data.get("type") or q.get("type", "")
-                            if q_type not in ("binary", "forecast", ""):
-                                continue
-
-                            n_forecasts = (
-                                question_data.get("nr_forecasters") or
-                                question_data.get("number_of_forecasters") or
-                                q.get("nr_forecasters") or
-                                q.get("number_of_forecasters") or 0
-                            )
-
-                            # Try every known field for community probability
-                            pred = None
-                            # v4 format
-                            agg = question_data.get("aggregations", {})
-                            if agg:
-                                recency = agg.get("recency_weighted", {}) or {}
-                                latest = recency.get("history", [{}])
-                                if latest:
-                                    pred = latest[-1].get("means", [None])[0] if latest[-1].get("means") else None
-                                if pred is None:
-                                    pred = recency.get("latest", {}).get("means", [None])[0] if recency.get("latest") else None
-                            # v2 format
-                            if pred is None:
-                                cp = question_data.get("community_prediction") or q.get("community_prediction") or {}
-                                if isinstance(cp, dict):
-                                    pred = (cp.get("full", {}) or {}).get("q2") or cp.get("q2")
-                                elif isinstance(cp, (int, float)):
-                                    pred = cp
-                            # metaculus_prediction fallback
-                            if pred is None:
-                                mp = question_data.get("metaculus_prediction") or q.get("metaculus_prediction") or {}
-                                if isinstance(mp, dict):
-                                    pred = (mp.get("full", {}) or {}).get("q2") or mp.get("q2")
-                            # direct probability field
-                            if pred is None:
-                                pred = question_data.get("probability") or q.get("probability")
-
-                            if pred is None:
-                                continue
-                            try:
-                                pred_float = float(pred)
-                                if pred_float > 1:
-                                    pred_float /= 100.0
-                                pred_float = max(0.0, min(1.0, pred_float))
-                            except (TypeError, ValueError):
-                                continue
-
-                            qid = question_data.get("id") or q.get("id")
-                            questions.append({
-                                "id":          qid,
-                                "title":       title,
-                                "probability": pred_float,
-                                "forecasters": int(n_forecasts),
-                                "url":         f"https://www.metaculus.com/questions/{qid}/",
-                            })
-
-            except Exception as e:
-                print(f"[🎯 META] API error ({api_url}): {e}")
-
-        print(f"[🎯 META] Parsed {len(questions)} questions with predictions")
-        return questions
-
-    async def _match_with_metaculus(
-        self, markets: List[Dict], questions: List[Dict]
-    ) -> List[Signal]:
-        """Match Metaculus questions to Polymarket markets by keyword overlap."""
+    async def _match_metaculus(self, tradeable: List[Dict]) -> List[Signal]:
         signals: List[Signal] = []
+        meta_questions = await self._fetch_metaculus_questions(limit=50)
+        if not meta_questions:
+            return signals
 
-        for q in questions:
-            q_words = set(_tokenise(q["title"]))
-            meta_prob = q["probability"]
+        for market in tradeable:
+            name   = market["name"].lower()
+            tokens = _tokenise(name)
 
-            best_market: Optional[Dict] = None
-            best_overlap = 0
+            best_q:     Optional[Dict] = None
+            best_score: int            = 0
 
-            for m in markets:
-                m_words = set(_tokenise(m["name"]))
-                overlap = len(q_words & m_words) / max(len(q_words | m_words), 1)
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_market = m
+            for q in meta_questions:
+                q_tokens = _tokenise(q.get("title", "").lower())
+                score    = len(set(tokens) & set(q_tokens))
+                if score > best_score and score >= 3:
+                    best_score = score
+                    best_q     = q
 
-            if best_market is None or best_overlap < 0.15:
-                continue   # No good match
-
-            liq  = best_market["_liq"]
-            poly_prob = liq["best_bid"]
-            divergence = abs(poly_prob - meta_prob)
-
-            print(f"[🎯 META] Match ({best_overlap:.0%}): {best_market['name'][:45]}")
-            print(f"[🎯 META]   Meta={meta_prob:.2%}, Poly={poly_prob:.2%}, div={divergence:.2%}")
-
-            if divergence < self.MIN_DIVERGENCE:
+            if not best_q:
                 continue
 
-            outcome = "YES" if meta_prob > poly_prob else "NO"
-            confidence = 60 + divergence * 200
-            confidence = min(confidence, 90)
+            cp = best_q.get("community_prediction")
+            if cp is None:
+                continue
+            meta_prob = float(cp)
+            liq       = market["_liq"]
+            poly_prob = liq["best_bid"]
+            div       = abs(poly_prob - meta_prob)
+            forecasters = best_q.get("number_of_forecasters", 0)
 
-            exp_profit = divergence * 100
+            print(f"[🎯 META] {market['name'][:45]}")
+            print(f"[🎯 META]   meta={meta_prob:.2%} poly={poly_prob:.2%} "
+                  f"div={div:.2%} forecasters={forecasters}")
+
+            if div < self.MIN_DIVERGENCE or forecasters < self.MIN_FORECASTERS:
+                continue
+
+            outcome    = "YES" if meta_prob > poly_prob else "NO"
+            confidence = min(55 + div * 200, 92)
+            exp_profit = div * 100
             if exp_profit < config.MIN_PROFIT_PERCENT:
                 continue
 
-            sig = Signal(
+            signals.append(Signal(
                 strategy="🎯 Metaculus Консенсус",
-                market_id=best_market["id"],
-                market_name=best_market["name"],
+                market_id=market["id"],
+                market_name=market["name"],
                 current_price=poly_prob,
                 expected_outcome=outcome,
                 confidence=round(confidence, 1),
                 expected_profit=round(exp_profit, 2),
                 liquidity_volume_24h=liq["volume_24h"],
                 bid_ask_spread=liq["spread_pct"],
-                source_url=q["url"],
-                polymarket_url=f"https://polymarket.com/event/{best_market['slug']}",
+                source_url=best_q.get("url", ""),
+                polymarket_url=f"https://polymarket.com/event/{market['slug']}",
                 timestamp=datetime.now(),
-                end_date=best_market.get("end_date"),
+                end_date=market.get("end_date"),
                 details={
                     "metaculus_probability": meta_prob,
                     "polymarket_probability": poly_prob,
-                    "divergence": divergence,
-                    "forecasters": q["forecasters"],
-                    "match_overlap": best_overlap,
+                    "divergence":            div,
+                    "forecasters":           forecasters,
+                    "metaculus_title":       best_q.get("title", ""),
                 }
-            )
-            signals.append(sig)
-            print(f"[🎯 META]   ✅ SIGNAL | {outcome} | conf={confidence:.1f}%")
+            ))
+            print(f"[🎯 META] ✅ SIGNAL | {outcome} | conf={confidence:.1f}%")
 
             if len(signals) >= 6:
                 break
 
         return signals
 
-    async def _ai_expert_signals(
-        self, markets: List[Dict], already_found: List[Signal]
-    ) -> List[Signal]:
-        """Use AI as an independent expert when Metaculus match count is low."""
-        signals: List[Signal] = []
-        found_ids = {s.market_id for s in already_found}
+    async def _fetch_metaculus_questions(self, limit: int = 50) -> List[Dict]:
+        headers = {}
+        if self.metaculus_key:
+            headers["Authorization"] = f"Token {self.metaculus_key}"
 
-        for market in markets[:25]:
+        params = {
+            "status":   "open",
+            "type":     "forecast",
+            "order_by": "-activity",
+            "limit":    limit,
+        }
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as session:
+                async with session.get(
+                    self.METACULUS_API,
+                    params=params,
+                    headers=headers,
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[🎯 META] Metaculus API {resp.status}")
+                        return []
+                    data = await resp.json()
+                    return data.get("results", [])
+        except Exception as e:
+            print(f"[🎯 META] Metaculus fetch error: {e}")
+            return []
+
+    async def _ai_expert_signals(
+        self, tradeable: List[Dict], already: List[Signal]
+    ) -> List[Signal]:
+        if not self.gemini_key:
+            return []
+
+        signals:  List[Signal] = []
+        found_ids = {s.market_id for s in already}
+
+        for market in tradeable[: self.AI_FALLBACK_N]:
             if market["id"] in found_ids:
                 continue
 
-            liq = market["_liq"]
+            liq       = market["_liq"]
             poly_prob = liq["best_bid"]
 
-            expert_prob = await self._ai_estimate_probability(market)
+            expert_prob = await self._ai_estimate(market)
             if expert_prob is None:
                 continue
 
-            divergence = abs(poly_prob - expert_prob)
-            print(f"[🎯 META/AI] {market['name'][:45]}")
-            print(f"[🎯 META/AI]   AI={expert_prob:.2%}, Poly={poly_prob:.2%}, div={divergence:.2%}")
+            div = abs(poly_prob - expert_prob)
+            print(f"[🎯 META/AI] {market['name'][:45]} "
+                  f"ai={expert_prob:.2%} poly={poly_prob:.2%} div={div:.2%}")
 
-            if divergence < 0.15:
+            if div < 0.15:
                 continue
 
-            outcome = "YES" if expert_prob > poly_prob else "NO"
-            confidence = 55 + divergence * 180
-            confidence = min(confidence, 87)
-
-            exp_profit = divergence * 100
+            outcome    = "YES" if expert_prob > poly_prob else "NO"
+            confidence = min(55 + div * 180, 87)
+            exp_profit = div * 100
             if exp_profit < config.MIN_PROFIT_PERCENT:
                 continue
 
-            sig = Signal(
+            signals.append(Signal(
                 strategy="🎯 Metaculus Консенсус",
                 market_id=market["id"],
                 market_name=market["name"],
@@ -986,77 +800,49 @@ class MetaculusStrategy:
                 details={
                     "metaculus_probability": expert_prob,
                     "polymarket_probability": poly_prob,
-                    "divergence": divergence,
-                    "forecasters": 0,
-                    "source": "AI Expert Estimate",
+                    "divergence":            div,
+                    "forecasters":           0,
+                    "source":                "AI Expert Estimate",
                 }
-            )
-            signals.append(sig)
+            ))
             found_ids.add(market["id"])
-            print(f"[🎯 META/AI]   ✅ SIGNAL | {outcome} | conf={confidence:.1f}%")
+            print(f"[🎯 META/AI] ✅ SIGNAL | {outcome} | conf={confidence:.1f}%")
 
             if len(signals) >= 4:
                 break
 
+            await asyncio.sleep(0.5)
+
         return signals
 
-    async def _ai_estimate_probability(self, market: Dict) -> Optional[float]:
-        prompt = f"""You are a superforecaster. Estimate the probability of this event resolving YES.
-
-QUESTION: {market['name']}
-CURRENT POLYMARKET PRICE: {market.get('_liq', {}).get('best_bid', 0.5):.1%}
-
-Reply with ONLY a number between 0 and 100. No other text."""
-
-        # Try Gemini
-        if self.gemini_key:
-            try:
-                url  = f"{self.GEMINI_ENDPOINT}?key={self.gemini_key}"
-                body = {"contents": [{"parts": [{"text": prompt}]}]}
-                async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=20)
-                ) as session:
-                    async with session.post(url, json=body) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            text = (
-                                data.get("candidates", [{}])[0]
-                                   .get("content", {})
-                                   .get("parts", [{}])[0]
-                                   .get("text", "")
-                            )
-                            nums = re.findall(r"[\d.]+", text)
-                            if nums:
-                                p = float(nums[0])
-                                return max(0.0, min(1.0, p / 100.0 if p > 1 else p))
-            except Exception as e:
-                print(f"[🎯 META/AI] Gemini error: {e}")
-
-        # Fallback: Ollama
-        if self.ollama_model:
-            try:
-                payload = {
-                    "model":  self.ollama_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": 20},
-                }
-                resp = await asyncio.to_thread(
-                    requests.post,
-                    f"{self.OLLAMA_HOST}/api/generate",
-                    json=payload,
-                    timeout=60,
-                )
-                if resp.status_code == 200:
-                    text = resp.json().get("response", "")
-                    nums = re.findall(r"[\d.]+", text)
-                    if nums:
-                        p = float(nums[0])
-                        return max(0.0, min(1.0, p / 100.0 if p > 1 else p))
-                await asyncio.sleep(1.5)
-            except Exception as e:
-                print(f"[🎯 META/AI] Ollama error: {e}")
-
+    async def _ai_estimate(self, market: Dict) -> Optional[float]:
+        prompt = (
+            f"You are a superforecaster. Estimate the probability of this event resolving YES.\n\n"
+            f"QUESTION: {market['name']}\n"
+            f"CURRENT POLYMARKET PRICE: {market.get('_liq', {}).get('best_bid', 0.5):.1%}\n\n"
+            f"Reply with ONLY a number between 0 and 100. No other text."
+        )
+        try:
+            url  = f"{self.GEMINI_ENDPOINT}?key={self.gemini_key}"
+            body = {"contents": [{"parts": [{"text": prompt}]}]}
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as session:
+                async with session.post(url, json=body) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        text = (
+                            data.get("candidates", [{}])[0]
+                                .get("content", {})
+                                .get("parts", [{}])[0]
+                                .get("text", "")
+                        )
+                        nums = re.findall(r"[\d.]+", text)
+                        if nums:
+                            p = float(nums[0])
+                            return max(0.0, min(1.0, p / 100.0 if p > 1 else p))
+        except Exception as e:
+            print(f"[🎯 META/AI] Gemini error: {e}")
         return None
 
 
@@ -1065,7 +851,7 @@ Reply with ONLY a number between 0 and 100. No other text."""
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SignalGenerator:
-    """Combines all three strategies and returns deduplicated, sorted signals."""
+    """Combines all three strategies; deduplicates and sorts results."""
 
     def __init__(self):
         self.uma_strategy       = UMAOracleStrategy()
@@ -1074,11 +860,14 @@ class SignalGenerator:
 
     async def generate_all_signals(self) -> List[Signal]:
         print("\n" + "=" * 60)
-        print("[🚀 SIGNAL GENERATOR] Full Polymarket scan + all strategies")
+        print("[🚀 SIGNAL GENERATOR] Starting full scan")
         print(f"[🚀] Filters: MinVol=${config.MIN_VOLUME_24H:,.0f} | "
               f"MaxSpread={config.MAX_SPREAD_PERCENT:.0f}% | "
               f"MinProfit={config.MIN_PROFIT_PERCENT:.1f}%")
         print("=" * 60)
+
+        # Warm up cache ONCE before parallel strategies run
+        await fetch_polymarket_markets()
 
         uma_res, news_res, meta_res = await asyncio.gather(
             self.uma_strategy.get_signals(),
@@ -1099,8 +888,8 @@ class SignalGenerator:
                 all_signals.extend(result)
                 print(f"[🚀] {name}: {len(result)} signals")
 
-        # Deduplicate by market_id + strategy
-        seen:    set          = set()
+        # Deduplicate
+        seen:   set          = set()
         unique: List[Signal] = []
         for sig in all_signals:
             key = f"{sig.market_id}:{sig.strategy}"
@@ -1108,23 +897,22 @@ class SignalGenerator:
                 seen.add(key)
                 unique.append(sig)
 
-        # Global sort: soonest expiry → confidence
-        unique.sort(key=lambda s: (
-            _days_sort_key_str(s.end_date),
-            -s.confidence
-        ))
+        unique.sort(key=lambda s: (_days_key_str(s.end_date), -s.confidence))
 
         print(f"\n[🚀] TOTAL UNIQUE SIGNALS: {len(unique)}")
         for i, s in enumerate(unique[:5], 1):
             print(f"  {i}. {s.strategy} | {s.market_name[:40]} | "
                   f"conf={s.confidence:.1f}% | profit={s.expected_profit:.1f}%")
         print("=" * 60 + "\n")
+
+        # Release cache after cycle to free memory
+        _cache.clear()
         return unique
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _days_sort_key(days) -> float:
+def _days_key(days) -> float:
     if days is None:
         return 9999.0
     try:
@@ -1133,7 +921,7 @@ def _days_sort_key(days) -> float:
         return 9999.0
 
 
-def _days_sort_key_str(end_date_str: Optional[str]) -> float:
+def _days_key_str(end_date_str: Optional[str]) -> float:
     if not end_date_str:
         return 9999.0
     try:
@@ -1145,7 +933,6 @@ def _days_sort_key_str(end_date_str: Optional[str]) -> float:
 
 
 def _tokenise(text: str) -> List[str]:
-    """Lowercase word tokens for keyword matching."""
     stop = {
         "the", "a", "an", "of", "in", "on", "at", "to", "by", "is", "will",
         "be", "for", "or", "and", "with", "that", "this", "it", "from",
