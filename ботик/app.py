@@ -1,8 +1,8 @@
 """
-Polymarket Signal Bot — Web Service entry point (Render / HF Spaces).
+Polymarket Signal Bot — Web Service entry point (Render).
 
-FastAPI app listens on PORT from environment.
-Telegram bot runs via asyncio.create_task inside the same event loop as FastAPI.
+FastAPI listens on PORT.
+Telegram bot runs as an asyncio task inside the same event loop.
 """
 from __future__ import annotations
 
@@ -12,17 +12,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 
-
-# ── Token validation ─────────────────────────────────────────────────────────
 _token = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN", "")
 if not _token:
     print("=" * 60)
-    print("ERROR: TELEGRAM_TOKEN (or BOT_TOKEN) is not set!")
-    print("  Set it as an environment variable before starting.")
+    print("WARNING: TELEGRAM_TOKEN is not set — bot will not start.")
     print("=" * 60)
 
-
-# ── Lifespan: start/stop bot alongside FastAPI ───────────────────────────────
 _bot_task: asyncio.Task | None = None
 
 
@@ -31,7 +26,6 @@ async def lifespan(application: FastAPI):
     global _bot_task
 
     if not _token:
-        print("[BOT] Skipping bot start — no TELEGRAM_TOKEN provided.")
         yield
         return
 
@@ -60,9 +54,8 @@ async def lifespan(application: FastAPI):
     _bot_task = asyncio.create_task(_bot_main())
     print("[MAIN] Telegram bot task started")
 
-    yield  # FastAPI is running
+    yield  # FastAPI serves requests here
 
-    # Shutdown
     if _bot_task and not _bot_task.done():
         _bot_task.cancel()
         try:
@@ -72,20 +65,28 @@ async def lifespan(application: FastAPI):
     print("[MAIN] Bot stopped")
 
 
-# ── FastAPI app ──────────────────────────────────────────────────────────────
-app = FastAPI(title="Polik Bott", lifespan=lifespan)
+app = FastAPI(title="Polymarket Signal Bot", lifespan=lifespan)
 
 
 @app.get("/")
-async def health(request: Request):
+async def root():
     return {"status": "ok"}
 
 
 @app.head("/")
-async def health_head(request: Request):
+async def root_head():
     return Response(status_code=200)
 
 
 @app.get("/health")
-async def health_check():
-    return {"status": "ok", "bot": "running" if _bot_task and not _bot_task.done() else "stopped"}
+async def health():
+    bot_ok = _bot_task is not None and not _bot_task.done()
+    return {
+        "status": "ok",
+        "bot":    "running" if bot_ok else "stopped",
+    }
+
+
+@app.head("/health")
+async def health_head():
+    return Response(status_code=200)
