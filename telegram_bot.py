@@ -1,0 +1,1642 @@
+"""Telegram Bot implementation for Polymarket Signal Bot using aiogram 3.x."""
+import asyncio
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from aiogram.filters import Command, CommandStart
+from aiogram.utils.markdown import hbold, hitalic
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+
+from config import config
+from database import db, User
+from logic import SignalGenerator, Signal
+from crypto_payments import (
+    create_invoice,
+    get_invoice_status,
+    register_pending_invoice,
+    remove_pending_invoice,
+    get_all_pending_invoices,
+    VIP_PLANS,
+    SUPPORTED_CURRENCIES,
+    CURRENCY_LABELS,
+)
+
+
+# ── Bot / dispatcher ──────────────────────────────────────────────────────────
+
+if not config.BOT_TOKEN:
+    print("=" * 60)
+    print("ERROR: TELEGRAM_TOKEN (or BOT_TOKEN) is not set!")
+    print("  Set it as an environment variable before starting.")
+    print("=" * 60)
+
+bot = Bot(
+    token=config.BOT_TOKEN or "INVALID_TOKEN_PLACEHOLDER",
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher()
+signal_generator = SignalGenerator()
+
+# ── In-memory signal queue (per user) ─────────────────────────────────────────
+_signal_queues: Dict[int, List[Signal]] = {}
+
+# ── Per-user settings (in-memory) ─────────────────────────────────────────────
+_user_settings: Dict[int, Dict] = {}
+_awaiting_input: Dict[int, str] = {}
+
+DEFAULT_SETTINGS = {
+    "min_profit": 3.0,
+    "min_confidence": 80,
+    "strategies": {"uma", "news", "meta"},
+    "max_signals": 3,
+}
+
+STRATEGY_LABELS = {
+    "uma":  "🔮 UMA Оракул",
+    "news": "📰 Новости",
+    "meta": "🎯 Metaculus",
+}
+
+
+def get_user_settings(telegram_id: int) -> Dict:
+    if telegram_id not in _user_settings:
+        _user_settings[telegram_id] = {
+            "min_profit": DEFAULT_SETTINGS["min_profit"],
+            "min_confidence": DEFAULT_SETTINGS["min_confidence"],
+            "strategies": set(DEFAULT_SETTINGS["strategies"]),
+            "max_signals": DEFAULT_SETTINGS["max_signals"],
+        }
+    return _user_settings[telegram_id]
+
+
+# ── Keyboards ─────────────────────────────────────────────────────────────────
+
+def get_landing_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard for the onboarding screen (non-VIP users)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Купить подписку", callback_data="vip_info")],
+        [InlineKeyboardButton(text="📖 Как оплатить? (пошагово)", callback_data="how_to_pay")],
+        [InlineKeyboardButton(text="❓ Что такое Polymarket Signals?", callback_data="about_signals")],
+    ])
+
+
+def get_about_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Купить подписку", callback_data="vip_info")],
+        [InlineKeyboardButton(text="← Назад", callback_data="back_to_landing")],
+    ])
+
+
+def get_main_menu_keyboard(signals_enabled: bool = True, is_vip: bool = False, is_superuser: bool = False):
+    if is_superuser:
+        vip_btn = InlineKeyboardButton(text="👑 ПРОФИЛЬ (Developer)", callback_data="profile")
+    elif is_vip:
+        vip_btn = InlineKeyboardButton(text="💎 VIP АКТИВЕН — Профиль", callback_data="profile")
+    else:
+        vip_btn = InlineKeyboardButton(text="💎 Купить подписку", callback_data="vip_info")
+
+    rows = [
+        [InlineKeyboardButton(text="🔍 Получить сигнал", callback_data="get_signal")],
+        [
+            vip_btn,
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
+        ],
+        [
+            InlineKeyboardButton(text="📚 ГАЙДЫ",    callback_data="guides"),
+            InlineKeyboardButton(text="🆘 ПОДДЕРЖКА", callback_data="support"),
+        ],
+    ]
+    if not is_vip and not is_superuser:
+        rows.insert(1, [InlineKeyboardButton(text="📖 Как оплатить подписку?", callback_data="how_to_pay")])
+    else:
+        rows.append([InlineKeyboardButton(text="👥 Реферальная программа", callback_data="referral")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_signal_keyboard(market_name: str, source_url: str, has_more: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+
+    if source_url and source_url.startswith("http"):
+        rows.append([InlineKeyboardButton(text="🔗 Источник / Обоснование", url=source_url)])
+
+    rows.append([InlineKeyboardButton(text="🔄 Другой сигнал", callback_data="next_signal")])
+    rows.append([InlineKeyboardButton(text="« Главное меню", callback_data="back_to_menu")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_vip_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 месяц — $10",   callback_data="vip_30")],
+        [InlineKeyboardButton(text="3 месяца — $25",  callback_data="vip_90")],
+        [InlineKeyboardButton(text="6 месяцев — $50", callback_data="vip_180")],
+        [InlineKeyboardButton(text="1 год — $100",    callback_data="vip_365")],
+        [InlineKeyboardButton(text="← Назад", callback_data="back_to_landing")],
+    ])
+
+
+def get_profile_keyboard(is_superuser: bool = False):
+    rows = []
+    if not is_superuser:
+        rows.append([InlineKeyboardButton(text="💎 Продлить подписку", callback_data="vip_info")])
+    else:
+        rows.append([InlineKeyboardButton(text="👑 Управление пользователями", callback_data="su_manage")])
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_su_manage_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Выдать VIP",      callback_data="su_add_vip")],
+        [InlineKeyboardButton(text="➖ Убрать VIP",      callback_data="su_remove_vip")],
+        [InlineKeyboardButton(text="🛡 Выдать Admin",    callback_data="su_add_admin")],
+        [InlineKeyboardButton(text="🚫 Убрать Admin",    callback_data="su_remove_admin")],
+        [InlineKeyboardButton(text="📋 Список VIP",      callback_data="su_list_vip")],
+        [InlineKeyboardButton(text="← Назад в профиль", callback_data="profile")],
+    ])
+
+
+def get_guides_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📖 Как начать?",            callback_data="guide_start")],
+        [InlineKeyboardButton(text="📊 Стратегии сигналов",     callback_data="guide_strategies")],
+        [InlineKeyboardButton(text="💰 Управление рисками",     callback_data="guide_risk")],
+        [InlineKeyboardButton(text="← Назад",                   callback_data="back_to_menu")],
+    ])
+
+
+def get_settings_keyboard(telegram_id: int, is_vip: bool) -> InlineKeyboardMarkup:
+    s = get_user_settings(telegram_id)
+    strats = s["strategies"]
+
+    uma_check  = "✅" if "uma"  in strats else "⬜️"
+    news_check = "✅" if "news" in strats else "⬜️"
+    meta_check = "✅" if "meta" in strats else "⬜️"
+
+    rows = [
+        [InlineKeyboardButton(
+            text=f"📈 Мин. профит: {s['min_profit']:.0f}% — нажмите чтобы изменить",
+            callback_data="input_profit"
+        )],
+        [InlineKeyboardButton(
+            text=f"🎯 Мин. уверенность: {s['min_confidence']}% — нажмите чтобы изменить",
+            callback_data="input_conf"
+        )],
+    ]
+
+    if not is_vip:
+        rows.append([InlineKeyboardButton(
+            text="🔒 Уверенность ниже 80% — только VIP",
+            callback_data="vip_info"
+        )])
+
+    rows.append([InlineKeyboardButton(
+        text="📡 Стратегии  ↓ вкл/выкл:",
+        callback_data="noop"
+    )])
+    rows.append([
+        InlineKeyboardButton(text=f"{uma_check} UMA Оракул", callback_data="toggle_strat_uma"),
+        InlineKeyboardButton(text=f"{news_check} Новости",   callback_data="toggle_strat_news"),
+        InlineKeyboardButton(text=f"{meta_check} Metaculus", callback_data="toggle_strat_meta"),
+    ])
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data="back_to_menu")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ── Text helpers ──────────────────────────────────────────────────────────────
+
+LANDING_TEXT = (
+    f"{hbold('📡 Polymarket Signals')}\n\n"
+    f"Торговые сигналы на предсказательных рынках.\n"
+    f"Доступ — только по подписке."
+)
+
+ABOUT_TEXT = (
+    f"{hbold('🔮 Polymarket Signals')}\n\n"
+    f"Мы мониторим тысячи предсказательных рынков в режиме реального времени "
+    f"и находим позиции с реальным математическим перевесом — "
+    f"до того, как их заметит рынок.\n\n"
+
+    f"{hbold('Три независимых источника сигналов:')}\n\n"
+
+    f"🔮 {hbold('UMA Оракул')}\n"
+    f"Отлавливает рынки, исход которых уже предрешён, "
+    f"но цена ещё не отреагировала. Оракул подтвердит через часы — "
+    f"мы сообщаем раньше. Исторический winrate ~90%.\n\n"
+
+    f"📰 {hbold('Новостной ИИ')}\n"
+    f"Gemini сканирует свежие новости и сопоставляет их с активными рынками. "
+    f"Если заголовок противоречит текущей цене — это сигнал.\n\n"
+
+    f"🎯 {hbold('Metaculus Консенсус')}\n"
+    f"Лучшие форкастеры мира дают прогнозы независимо от рынка. "
+    f"Расхождение их оценки с Polymarket более чем на 12% — "
+    f"арбитражная возможность.\n\n"
+
+    f"{hitalic('Каждый сигнал: позиция · точка входа · ожидаемый профит · уверенность.')}\n\n"
+    f"{hitalic('Не советы. Статистический перевес.')}"
+)
+
+MAIN_MENU_TEXT = (
+    f"{hbold('📡 Polymarket Signals')}\n\n"
+    f"Нажмите кнопку чтобы получить торговый сигнал 👇"
+)
+
+NO_ACCESS_TEXT = (
+    f"🔒 {hbold('Требуется подписка')}\n\n"
+    f"Эта функция доступна только подписчикам.\n"
+    f"Оформите доступ — это займёт меньше минуты."
+)
+
+
+# ── Command handlers ──────────────────────────────────────────────────────────
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    await db.get_or_create_user(user_id, message.from_user.username)
+
+    # ── Parse referral parameter (/start ref_12345) ───────────────────────────
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1:
+        param = args[1].strip()
+        if param.startswith("ref_"):
+            try:
+                referrer_id = int(param[4:])
+                # Don't let users refer themselves; only register once
+                if referrer_id != user_id and not await db.has_referral_record(user_id):
+                    # Referrer must exist and be a real user (not self-invite)
+                    await db.register_referral(referrer_id, user_id)
+            except (ValueError, Exception):
+                pass
+
+    is_vip   = await db.is_vip(user_id)
+    is_super = await db.is_superuser(user_id)
+
+    if is_super or is_vip:
+        # ── Already has access: show main menu ────────────────────────────────
+        user      = await db.get_or_create_user(user_id)
+        days_left = await db.get_vip_days_remaining(user_id)
+
+        if is_super:
+            sub = f"👑 {hbold('Статус: Developer / Lifetime')}"
+        else:
+            sub = f"💎 {hbold(f'Статус: VIP активен — {days_left} дн.')}"
+
+        await message.answer(
+            f"{hbold('🚀 Polymarket Signals')}\n\n{sub}\n\n"
+            f"{MAIN_MENU_TEXT}",
+            reply_markup=get_main_menu_keyboard(user.signals_enabled, is_vip, is_super)
+        )
+    else:
+        # ── No access: show landing ───────────────────────────────────────────
+        await message.answer(
+            f"{hbold('👋 Добро пожаловать!')}\n\n"
+            f"Это бот торговых сигналов для Polymarket — "
+            f"платформы предсказательных рынков.\n\n"
+            f"Доступ к сигналам открывается после оформления подписки.",
+            reply_markup=get_landing_keyboard()
+        )
+
+
+@dp.message(Command("addvip"))
+async def cmd_addvip(message: Message):
+    uid = message.from_user.id
+    if uid not in config.ADMIN_IDS and uid != config.SUPERUSER_ID:
+        await message.answer("❌ У вас нет прав администратора.")
+        return
+
+    args = message.text.split()[1:]
+    if len(args) != 2:
+        await message.answer("❌ Использование: /addvip [user_id] [days]")
+        return
+
+    try:
+        target_id = int(args[0])
+        days      = int(args[1])
+    except ValueError:
+        await message.answer("❌ user_id и days должны быть числами.")
+        return
+
+    success = await db.add_vip(target_id, uid, days)
+    if success:
+        await message.answer(f"✅ VIP добавлен! Пользователь: {target_id}, дней: {days}")
+        try:
+            await bot.send_message(
+                target_id,
+                f"🎉 {hbold('Вам выдан VIP доступ!')}\n\nСрок: {days} дней\n"
+                f"Используйте /start для обновления меню."
+            )
+        except Exception:
+            pass
+    else:
+        await message.answer("❌ Не удалось. Пользователь должен написать /start боту.")
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    uid = message.from_user.id
+    if uid not in config.ADMIN_IDS and uid != config.SUPERUSER_ID:
+        await message.answer("❌ У вас нет прав администратора.")
+        return
+
+    stats     = await db.get_signal_stats(days=30)
+    users     = await db.get_active_users()
+    vip_users = await db.get_vip_users()
+
+    text = (
+        f"{hbold('📊 Статистика бота за 30 дней')}\n\n"
+        f"👥 Активных пользователей: {len(users)}\n"
+        f"💎 VIP пользователей: {len(vip_users)}\n\n"
+        f"{hbold('Сигналы по стратегиям:')}\n"
+    )
+    for strategy, data in (stats or {}).items():
+        text += f"• {strategy}: {data['total']} всего, {data['verified']} проверено\n"
+    if not stats:
+        text += "Сигналов ещё нет\n"
+
+    await message.answer(text)
+
+
+# ── Callback handlers ─────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "noop")
+async def on_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+# ── Landing / onboarding ──────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "back_to_landing")
+async def on_back_to_landing(callback: CallbackQuery):
+    _awaiting_input.pop(callback.from_user.id, None)
+    await callback.message.edit_text(
+        f"{hbold('👋 Polymarket Signals')}\n\n"
+        f"Это бот торговых сигналов для Polymarket — "
+        f"платформы предсказательных рынков.\n\n"
+        f"Доступ к сигналам открывается после оформления подписки.",
+        reply_markup=get_landing_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "about_signals")
+async def on_about_signals(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(ABOUT_TEXT, reply_markup=get_about_keyboard())
+
+
+HOW_TO_PAY_TEXT = (
+    f"{hbold('📖 Как оплатить подписку — пошагово')}\n\n"
+
+    f"{hbold('Шаг 1. Скачайте @CryptoBot')}\n"
+    f"Найдите в Telegram: @CryptoBot\n"
+    f"Это официальный бот для крипто-платежей внутри Telegram.\n\n"
+
+    f"{hbold('Шаг 2. Пополните баланс')}\n"
+    f"В @CryptoBot нажмите {hbold('Пополнить')}.\n"
+    f"Доступные способы:\n"
+    f"• 💳 Карта (Visa/MC через P2P биржи)\n"
+    f"• 🏦 СБП / перевод на карту RU\n"
+    f"• 📲 Перевод с Binance, OKX, Bybit\n"
+    f"• 💵 Наличные через P2P (Binance P2P)\n\n"
+
+    f"{hbold('Как пополнить через P2P (самый простой способ для СНГ):')}\n"
+    f"1. Скопируйте адрес кошелька из @CryptoBot\n"
+    f"2. Зайдите на Binance P2P → «Купить» → выберите нужную монету\n"
+    f"3. Оплатите картой продавцу\n"
+    f"4. Монеты придут на Binance → переведите в @CryptoBot\n\n"
+
+    f"{hbold('Шаг 3. Выберите тариф и оплатите')}\n"
+    f"Вернитесь в этот бот → нажмите {hbold('💎 Купить подписку')} → выберите срок.\n"
+    f"Вы получите ссылку для оплаты — нажмите её, откроется @CryptoBot.\n"
+    f"Подтвердите платёж — доступ активируется {hbold('автоматически за секунды')}.\n\n"
+
+    f"{hbold('Доступные валюты для оплаты:')}\n"
+    f"USDT (сети BNB, TON, ARB) · TON · ETH · LTC · SOL\n\n"
+
+    f"{hitalic('❓ Остались вопросы — пишите @Poly_whale_adminn')}"
+)
+
+
+@dp.callback_query(F.data == "how_to_pay")
+async def on_how_to_pay(callback: CallbackQuery):
+    await callback.answer()
+    is_vip = await db.is_vip(callback.from_user.id)
+    is_sup = await db.is_superuser(callback.from_user.id)
+    back = "back_to_menu" if (is_vip or is_sup) else "back_to_landing"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="vip_info")],
+        [InlineKeyboardButton(text="← Назад", callback_data=back)],
+    ])
+    await callback.message.edit_text(HOW_TO_PAY_TEXT, reply_markup=kb)
+
+
+# ── Main menu ──────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "get_signal")
+async def on_get_signal(callback: CallbackQuery):
+    is_vip  = await db.is_vip(callback.from_user.id)
+    is_sup  = await db.is_superuser(callback.from_user.id)
+    if not (is_vip or is_sup):
+        await callback.answer()
+        await callback.message.edit_text(
+            NO_ACCESS_TEXT,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Оформить подписку", callback_data="vip_info")],
+                [InlineKeyboardButton(text="❓ Что такое Polymarket Signals?", callback_data="about_signals")],
+            ])
+        )
+        return
+
+    _awaiting_input.pop(callback.from_user.id, None)
+    await callback.answer("🔍 Сканирую...")
+    await check_signals_for_user(callback.from_user.id)
+
+
+@dp.callback_query(F.data == "next_signal")
+async def on_next_signal(callback: CallbackQuery):
+    uid    = callback.from_user.id
+    is_vip = await db.is_vip(uid)
+    is_sup = await db.is_superuser(uid)
+
+    if not (is_vip or is_sup):
+        await callback.answer("🔒 Требуется подписка", show_alert=True)
+        return
+
+    queue = _signal_queues.get(uid, [])
+    if not queue:
+        await callback.answer("🔄 Ищу новые сигналы...")
+        await check_signals_for_user(uid)
+        return
+
+    await callback.answer("📤 Отправляю следующий сигнал...")
+    signal = queue.pop(0)
+    _signal_queues[uid] = queue
+    await send_signal_to_user(uid, signal, is_vip or is_sup, has_more=bool(queue))
+
+
+# ── Settings handlers ──────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "settings")
+async def on_settings(callback: CallbackQuery):
+    is_vip = await db.is_vip(callback.from_user.id)
+    is_sup = await db.is_superuser(callback.from_user.id)
+
+    if not (is_vip or is_sup):
+        await callback.answer()
+        await callback.message.edit_text(
+            NO_ACCESS_TEXT,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Оформить подписку", callback_data="vip_info")],
+                [InlineKeyboardButton(text="← Назад", callback_data="back_to_landing")],
+            ])
+        )
+        return
+
+    s = get_user_settings(callback.from_user.id)
+    strats_text = " · ".join(STRATEGY_LABELS[k] for k in s["strategies"]) or "нет"
+    mp = f"{s['min_profit']:.0f}%"
+    mc = f"{s['min_confidence']}%"
+    text = (
+        f"{hbold('⚙️ Настройки сигналов')}\n\n"
+        f"📈 Мин. профит: {hbold(mp)}\n"
+        f"🎯 Мин. уверенность: {hbold(mc)}\n"
+        f"📡 Стратегии: {strats_text}\n\n"
+        f"{hitalic('Нажмите кнопку чтобы изменить:')}"
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=get_settings_keyboard(callback.from_user.id, is_vip or is_sup)
+    )
+
+
+async def _refresh_settings_message(callback: CallbackQuery, is_vip: bool):
+    s = get_user_settings(callback.from_user.id)
+    strats_text = " · ".join(STRATEGY_LABELS[k] for k in s["strategies"]) or "нет"
+    mp = f"{s['min_profit']:.0f}%"
+    mc = f"{s['min_confidence']}%"
+    await callback.message.edit_text(
+        f"{hbold('⚙️ Настройки сигналов')}\n\n"
+        f"📈 Мин. профит: {hbold(mp)}\n"
+        f"🎯 Мин. уверенность: {hbold(mc)}\n"
+        f"📡 Стратегии: {strats_text}\n\n"
+        f"{hitalic('Нажмите кнопку чтобы изменить:')}",
+        reply_markup=get_settings_keyboard(callback.from_user.id, is_vip)
+    )
+
+
+@dp.callback_query(F.data == "input_profit")
+async def on_input_profit(callback: CallbackQuery):
+    _awaiting_input[callback.from_user.id] = "profit"
+    await callback.answer()
+    await callback.message.answer(
+        "📈 Введите минимальный профит в % (например: 5)\n"
+        "Допустимый диапазон: 1–50"
+    )
+
+
+@dp.callback_query(F.data == "input_conf")
+async def on_input_conf(callback: CallbackQuery):
+    _awaiting_input[callback.from_user.id] = "conf"
+    await callback.answer()
+    is_vip = await db.is_vip(callback.from_user.id)
+    is_sup = await db.is_superuser(callback.from_user.id)
+    min_val = 65 if (is_vip or is_sup) else 80
+    await callback.message.answer(
+        f"🎯 Введите минимальную уверенность в % (например: 85)\n"
+        f"Допустимый диапазон: {min_val}–99"
+    )
+
+
+@dp.callback_query(F.data == "input_max_signals")
+async def on_input_max_signals(callback: CallbackQuery):
+    _awaiting_input[callback.from_user.id] = "max_signals"
+    await callback.answer()
+    await callback.message.answer(
+        "📦 Сколько сигналов присылать за один запрос?\n"
+        "Введите число от 1 до 10 (например: 3)"
+    )
+
+
+@dp.message(F.text)
+async def on_settings_text_input(message: Message):
+    uid = message.from_user.id
+    if uid not in _awaiting_input:
+        return
+
+    input_type = _awaiting_input.pop(uid)
+
+    # ── Superuser management inputs ───────────────────────────────────────────
+    if input_type.startswith("su_") and uid == config.SUPERUSER_ID:
+        await _handle_su_text_input(message, input_type)
+        return
+    text = message.text.strip().replace("%", "").replace(",", ".")
+
+    try:
+        val = float(text)
+    except ValueError:
+        _awaiting_input[uid] = input_type
+        await message.answer("❌ Введите только число, например: 5 или 85")
+        return
+
+    is_vip = await db.is_vip(uid)
+    is_sup = await db.is_superuser(uid)
+    s = get_user_settings(uid)
+
+    if input_type == "profit":
+        if val < 1 or val > 50:
+            _awaiting_input[uid] = "profit"
+            await message.answer("❌ Профит должен быть от 1 до 50%. Попробуйте снова:")
+            return
+        s["min_profit"] = val
+        await message.answer(f"✅ Мин. профит установлен: {val:.0f}%")
+
+    elif input_type == "conf":
+        min_val = 65 if (is_vip or is_sup) else 80
+        val = int(val)
+        if val < min_val or val > 99:
+            _awaiting_input[uid] = "conf"
+            lock = " (нужен VIP для <80%)" if not (is_vip or is_sup) else ""
+            await message.answer(f"❌ Уверенность должна быть от {min_val} до 99%{lock}. Попробуйте снова:")
+            return
+        s["min_confidence"] = val
+        await message.answer(f"✅ Мин. уверенность установлена: {val}%")
+
+    elif input_type == "max_signals":
+        val = int(val)
+        if val < 1 or val > 10:
+            _awaiting_input[uid] = "max_signals"
+            await message.answer("❌ Введите число от 1 до 10. Попробуйте снова:")
+            return
+        s["max_signals"] = val
+        await message.answer(f"✅ Бот будет присылать {val} сигнал(а/ов) за раз")
+
+    # Show updated settings
+    strats_text = " · ".join(STRATEGY_LABELS[k] for k in s["strategies"]) or "нет"
+    mp2 = f"{s['min_profit']:.0f}%"
+    mc2 = f"{s['min_confidence']}%"
+    await message.answer(
+        f"{hbold('⚙️ Настройки обновлены')}\n\n"
+        f"📈 Мин. профит: {hbold(mp2)}\n"
+        f"🎯 Мин. уверенность: {hbold(mc2)}\n"
+        f"📡 Стратегии: {strats_text}",
+        reply_markup=get_settings_keyboard(uid, is_vip or is_sup)
+    )
+
+
+@dp.callback_query(F.data.startswith("toggle_strat_"))
+async def on_toggle_strat(callback: CallbackQuery):
+    strat = callback.data.split("_")[-1]
+    s = get_user_settings(callback.from_user.id)
+    strats = s["strategies"]
+    if strat in strats:
+        if len(strats) <= 1:
+            await callback.answer("⚠️ Нужна хотя бы одна стратегия!", show_alert=True)
+            return
+        strats.discard(strat)
+        await callback.answer(f"❌ {STRATEGY_LABELS.get(strat, strat)} выключена")
+    else:
+        strats.add(strat)
+        await callback.answer(f"✅ {STRATEGY_LABELS.get(strat, strat)} включена")
+
+    is_vip = await db.is_vip(callback.from_user.id)
+    is_sup = await db.is_superuser(callback.from_user.id)
+    await _refresh_settings_message(callback, is_vip or is_sup)
+
+
+# ── Other callback handlers ────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "profile")
+async def on_profile(callback: CallbackQuery):
+    profile = await db.get_user_profile(callback.from_user.id)
+    if not profile:
+        await callback.answer("Ошибка загрузки профиля")
+        return
+
+    is_sup = profile["is_superuser"]
+    if is_sup:
+        status_line = f"👑 {hbold('Статус: Developer / Lifetime')}"
+        days_line   = "∞ бессрочно"
+    elif profile["days_remaining"] > 0:
+        status_line = f"💎 {hbold('Статус: VIP Active')}"
+        days_line   = f"📅 Осталось: {profile['days_remaining']} дн."
+    else:
+        status_line = f"⚠️ {hbold('Статус: Free')}"
+        days_line   = "🔒 Нет активной подписки"
+
+    text = (
+        f"👤 {hbold('Ваш профиль')}\n\n"
+        f"🆔 ID: {profile['telegram_id']}\n"
+        f"📝 Username: @{profile['username'] or 'N/A'}\n\n"
+        f"{status_line}\n{days_line}\n\n"
+        f"📅 Регистрация: {str(profile['created_at'])[:10]}"
+    )
+    await callback.message.edit_text(text, reply_markup=get_profile_keyboard(is_sup))
+
+
+@dp.callback_query(F.data == "stats_view")
+async def on_stats_view(callback: CallbackQuery):
+    await callback.answer()
+    is_sup = await db.is_superuser(callback.from_user.id)
+    is_vip = await db.is_vip(callback.from_user.id)
+
+    if is_sup or is_vip:
+        stats     = await db.get_signal_stats(days=30)
+        users     = await db.get_active_users()
+        vip_users = await db.get_vip_users()
+        text = (
+            f"{hbold('📊 Статистика бота')}\n\n"
+            f"👥 Активных: {len(users)}\n💎 VIP: {len(vip_users)}\n\n"
+        )
+        for strategy, data in (stats or {}).items():
+            text += f"• {strategy}: {data['total']} сигналов\n"
+        if not stats:
+            text += "Сигналов пока нет\n"
+    else:
+        text = f"{hbold('📊 Статистика')}\n\nДля просмотра оформите VIP."
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Назад", callback_data="profile")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "vip_info")
+async def on_vip_info(callback: CallbackQuery):
+    is_vip    = await db.is_vip(callback.from_user.id)
+    is_sup    = await db.is_superuser(callback.from_user.id)
+    days_left = await db.get_vip_days_remaining(callback.from_user.id)
+
+    if is_sup:
+        await callback.answer("👑 У вас lifetime доступ", show_alert=True)
+        return
+
+    if is_vip:
+        text = (
+            f"{hbold('💎 Ваша подписка активна')}\n\n"
+            f"📅 Осталось: {days_left} дн.\n\n"
+            f"✅ Все сигналы без ограничений\n"
+            f"✅ Confidence от 65%+\n"
+            f"✅ Все 3 стратегии\n\n"
+            f"{hitalic('Можно продлить досрочно — дни суммируются')}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="1 месяц — $10",   callback_data="vip_30")],
+            [InlineKeyboardButton(text="3 месяца — $25",  callback_data="vip_90")],
+            [InlineKeyboardButton(text="6 месяцев — $50", callback_data="vip_180")],
+            [InlineKeyboardButton(text="1 год — $100",    callback_data="vip_365")],
+            [InlineKeyboardButton(text="← Назад", callback_data="back_to_menu")],
+        ])
+    else:
+        text = (
+            f"{hbold('💎 Подписка Polymarket Signals')}\n\n"
+            f"✅ Сигналы в реальном времени\n"
+            f"✅ Три независимые стратегии\n"
+            f"✅ Confidence от 65%+ (без ограничений)\n"
+            f"✅ Настройка фильтров\n"
+            f"✅ Гайды по управлению рисками\n\n"
+            f"{hitalic('Выберите срок подписки:')}"
+        )
+        kb = get_vip_keyboard()
+
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.in_({"vip_30", "vip_90", "vip_180", "vip_365"}))
+async def on_vip_select(callback: CallbackQuery):
+    plan_key = callback.data
+    days, price, label = VIP_PLANS[plan_key]
+    await callback.answer()
+
+    if not config.CRYPTO_BOT_TOKEN:
+        text = (
+            f"{hbold(f'💎 Подписка {label} — ${price:.0f}')}\n\n"
+            f"Для оплаты напишите администратору:\n"
+            f"👉 @Poly_whale_adminn\n\n"
+            f"Ваш Telegram ID: <code>{callback.from_user.id}</code>\n"
+            f"Тариф: {label} ({days} дней)\n\n"
+            f"{hitalic('После подтверждения оплаты доступ активируется вручную')}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← Назад к тарифам", callback_data="vip_info")]
+        ])
+        await callback.message.edit_text(text, reply_markup=kb)
+        return
+
+    # Show currency selection
+    currency_rows = []
+    row = []
+    for i, cur in enumerate(SUPPORTED_CURRENCIES):
+        row.append(InlineKeyboardButton(
+            text=CURRENCY_LABELS.get(cur, cur),
+            callback_data=f"pay_{plan_key}_{cur}"
+        ))
+        if len(row) == 2:
+            currency_rows.append(row)
+            row = []
+    if row:
+        currency_rows.append(row)
+    currency_rows.append([InlineKeyboardButton(text="← Назад к тарифам", callback_data="vip_info")])
+
+    text = (
+        f"💎 {hbold(f'Подписка {label} — ${price:.0f}')}\n\n"
+        f"Выберите валюту для оплаты через @CryptoBot:\n\n"
+        f"{hitalic('Все валюты конвертируются автоматически.')}"
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=currency_rows))
+
+
+@dp.callback_query(F.data.startswith("pay_vip_"))
+async def on_currency_selected(callback: CallbackQuery):
+    # callback_data: pay_vip_30_USDT  or  pay_vip_365_BTC
+    parts = callback.data.split("_")
+    # parts: ['pay', 'vip', '30', 'USDT']
+    plan_key = f"vip_{parts[2]}"
+    currency = parts[3]
+
+    days, price, label = VIP_PLANS[plan_key]
+    await callback.answer(f"⏳ Создаю счёт в {currency}...")
+
+    invoice = await create_invoice(callback.from_user.id, plan_key, currency)
+
+    if not invoice:
+        text = (
+            f"{hbold('⚠️ Автооплата временно недоступна')}\n\n"
+            f"Оплатите вручную через администратора:\n"
+            f"👉 @Poly_whale_adminn\n\n"
+            f"Ваш ID: <code>{callback.from_user.id}</code>\n"
+            f"Тариф: {label} ({days} дней) — ${price:.0f}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← Назад", callback_data="vip_info")]
+        ])
+        await callback.message.edit_text(text, reply_markup=kb)
+        return
+
+    register_pending_invoice(invoice["invoice_id"], callback.from_user.id, days, plan_key)
+
+    inv_id = invoice["invoice_id"]
+    cur = invoice["currency"]
+    text = (
+        f"💎 {hbold(f'Подписка {label} — ${price:.0f}')}\n\n"
+        f"💳 Валюта оплаты: {hbold(cur)}\n"
+        f"⏰ Счёт действителен: 1 час\n\n"
+        f"1️⃣ Нажмите кнопку {hbold('«Оплатить»')} ниже\n"
+        f"2️⃣ Оплатите в @CryptoBot\n"
+        f"3️⃣ Доступ активируется {hbold('автоматически')} ✅\n\n"
+        f"{hitalic(f'Invoice ID: {inv_id}')}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить в @CryptoBot", url=invoice["pay_url"])],
+        [InlineKeyboardButton(text="✅ Я оплатил — проверить", callback_data=f"check_payment_{inv_id}")],
+        [InlineKeyboardButton(text="← Назад к тарифам", callback_data="vip_info")],
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("check_payment_"))
+async def on_check_payment(callback: CallbackQuery):
+    try:
+        invoice_id = int(callback.data.split("_")[-1])
+    except ValueError:
+        await callback.answer("❌ Неверный номер счёта", show_alert=True)
+        return
+
+    await callback.answer("🔍 Проверяю оплату...")
+
+    status = await get_invoice_status(invoice_id)
+
+    if status == "paid":
+        from crypto_payments import get_pending_invoice
+        pending = get_pending_invoice(invoice_id)
+        if pending:
+            days = pending["days"]
+            success = await db.add_vip(callback.from_user.id, config.SUPERUSER_ID, days)
+            remove_pending_invoice(invoice_id)
+            if success:
+                days_label = VIP_PLANS.get(pending["plan_key"], (days, 0, f"{days} дней"))[2]
+                # ── Referral bonus ────────────────────────────────────────────
+                referrer_id = await db.get_referrer(callback.from_user.id)
+                if referrer_id and referrer_id != config.SUPERUSER_ID:
+                    bonus_granted = await db.pay_referral_bonus(referrer_id, callback.from_user.id)
+                    if bonus_granted:
+                        try:
+                            await bot.send_message(
+                                referrer_id,
+                                f"🎁 {hbold('+7 дней к подписке!')}\n\n"
+                                f"Ваш реферал оформил VIP — бонус начислен автоматически.\n\n"
+                                f"Приводите ещё! /start → 👥 Реферальная программа"
+                            )
+                        except Exception:
+                            pass
+                await callback.message.edit_text(
+                    f"🎉 {hbold('Оплата подтверждена! Доступ открыт!')}\n\n"
+                    f"✅ Тариф: {days_label}\n"
+                    f"✅ Дней добавлено: {days}\n\n"
+                    f"Добро пожаловать в Polymarket Signals 👇",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🚀 Открыть меню", callback_data="back_to_menu")]
+                    ])
+                )
+                return
+
+        is_vip = await db.is_vip(callback.from_user.id)
+        if is_vip:
+            await callback.message.edit_text(
+                f"✅ {hbold('Подписка активна!')}\n\nВсё в порядке.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🚀 Открыть меню", callback_data="back_to_menu")]
+                ])
+            )
+        else:
+            await callback.answer("✅ Оплата найдена, активируем...", show_alert=True)
+
+    elif status == "active":
+        await callback.answer(
+            "⏳ Оплата ещё не поступила. Попробуйте через минуту.",
+            show_alert=True
+        )
+
+    elif status == "expired":
+        await callback.message.edit_text(
+            f"⏰ {hbold('Счёт истёк.')}\n\nПожалуйста, создайте новый.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Новый счёт", callback_data="vip_info")]
+            ])
+        )
+
+    else:
+        await callback.answer("❌ Не удалось проверить статус. Попробуйте позже.", show_alert=True)
+
+
+@dp.callback_query(F.data == "guides")
+async def on_guides(callback: CallbackQuery):
+    is_vip = await db.is_vip(callback.from_user.id)
+    is_sup = await db.is_superuser(callback.from_user.id)
+
+    if not (is_vip or is_sup):
+        await callback.answer()
+        await callback.message.edit_text(
+            NO_ACCESS_TEXT,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Оформить подписку", callback_data="vip_info")],
+                [InlineKeyboardButton(text="← Назад", callback_data="back_to_landing")],
+            ])
+        )
+        return
+
+    await callback.message.edit_text(
+        f"{hbold('📚 Обучающие материалы')}\n\nВыберите раздел:",
+        reply_markup=get_guides_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "guide_start")
+async def on_guide_start(callback: CallbackQuery):
+    text = (
+        f"{hbold('📖 Как начать торговать на Polymarket?')}\n\n"
+        f"1️⃣ {hbold('Регистрация')}\n"
+        f"• Перейдите на polymarket.com\n"
+        f"• Подключите кошелёк (MetaMask / Coinbase Wallet)\n"
+        f"• Пополните баланс USDC на сети Polygon\n\n"
+        f"2️⃣ {hbold('Понимание рынков')}\n"
+        f"• YES токены = ставка на «Да» (цена = вероятность)\n"
+        f"• NO токены = ставка на «Нет»\n"
+        f"• Рынок разрешается в 1.0 или 0.0\n\n"
+        f"3️⃣ {hbold('Использование сигналов бота')}\n"
+        f"• Нажмите «Получить сигнал»\n"
+        f"• Скопируйте название рынка кнопкой 📋\n"
+        f"• Найдите рынок на polymarket.com и войдите в позицию\n"
+        f"• Не вкладывайте более 5% депозита в одну позицию\n\n"
+        f"🌐 {hbold('Если вы в России — нужен VPN')}\n"
+        f"• Polymarket заблокирован в РФ — без VPN сайт не откроется\n"
+        f"• Рекомендуем бесплатный {hbold('Urban VPN')} — urbanvpn.com\n"
+        f"• Доступен на Android, iOS и ПК — полностью бесплатный\n"
+        f"• Выбирайте японский сервер — стабильно и быстро\n\n"
+        f"{hitalic('⚠️ Торговля связана с риском.')}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Назад к гайдам", callback_data="guides")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "guide_strategies")
+async def on_guide_strategies(callback: CallbackQuery):
+    text = (
+        f"{hbold('📊 Стратегии генерации сигналов')}\n\n"
+        f"🔮 {hbold('UMA Оракул')}\n"
+        f"Находит рынки, истекающие в ближайшие 3 дня, с ценой ≥88% или ≤12%. "
+        f"Такие рынки фактически уже разрешены — UMA оракул лишь подтверждает. "
+        f"Ожидаемый winrate: ~90%\n\n"
+        f"📰 {hbold('Новостной Анализ')}\n"
+        f"AI (Gemini) анализирует RSS-новости и сопоставляет заголовки "
+        f"с активными рынками. Порог: confidence ≥72%.\n\n"
+        f"🎯 {hbold('Metaculus Консенсус')}\n"
+        f"Сравнивает прогнозы суперфорекастеров Metaculus с ценой Polymarket. "
+        f"Расхождение >12% — арбитражная возможность.\n\n"
+        f"{hitalic('Минимальный confidence: VIP = 65%, стандарт = 80%')}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Назад к гайдам", callback_data="guides")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "guide_risk")
+async def on_guide_risk(callback: CallbackQuery):
+    text = (
+        f"{hbold('💰 Управление рисками')}\n\n"
+        f"⚠️ {hbold('Золотые правила')}\n"
+        f"• Максимум 5% от депозита на одну позицию\n"
+        f"• Диверсифицируйте по разным рынкам\n"
+        f"• Стоп-лосс мысленный: -25%\n\n"
+        f"📊 {hbold('Размер позиции по confidence')}\n"
+        f"• 65-75% → 1-2% от депозита\n"
+        f"• 75-85% → 2-3% от депозита\n"
+        f"• 85%+   → до 5% от депозита\n\n"
+        f"🔄 {hbold('Выход')}\n"
+        f"• Берите прибыль при +25-30%\n"
+        f"• Следите за датой истечения рынка\n\n"
+        f"{hitalic('Даже при 65% winrate правильный мани-менеджмент даёт прибыль!')}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Назад к гайдам", callback_data="guides")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "support")
+async def on_support(callback: CallbackQuery):
+    text = (
+        f"{hbold('🆘 Поддержка')}\n\n"
+        f"По вопросам подписки и сотрудничества:\n"
+        f"📩 @Poly_whale_adminn\n\n"
+        f"Ваш ID: {hbold(str(callback.from_user.id))}\n\n"
+        f"{hitalic('Отвечаем в течение 24 часов')}"
+    )
+    is_vip = await db.is_vip(callback.from_user.id)
+    is_sup = await db.is_superuser(callback.from_user.id)
+    if is_vip or is_sup:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← Назад", callback_data="back_to_menu")]
+        ])
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← Назад", callback_data="back_to_landing")]
+        ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "referral")
+async def on_referral(callback: CallbackQuery):
+    uid    = callback.from_user.id
+    is_vip = await db.is_vip(uid)
+    is_sup = await db.is_superuser(uid)
+
+    if not (is_vip or is_sup):
+        await callback.answer("🔒 Только для VIP", show_alert=True)
+        return
+
+    await callback.answer()
+
+    bot_username = (await bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{uid}"
+    stats = await db.get_referral_stats(uid)
+
+    slots_left = stats["slots_left_this_month"]
+    paid_month = stats["paid_this_month"]
+
+    if slots_left > 0:
+        month_line = f"📅 В этом месяце: {paid_month}/4 рефералов ({slots_left} слот(а) осталось)"
+    else:
+        month_line = "📅 В этом месяце: лимит 4/4 исчерпан — бонусы обновятся 1-го числа"
+
+    text = (
+        f"👥 {hbold('Реферальная программа')}\n\n"
+        f"Приглашайте друзей — получайте бонусные дни к подписке!\n\n"
+        f"🔗 {hbold('Ваша ссылка:')}\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"📊 {hbold('Ваша статистика:')}\n"
+        f"👤 Приглашено всего: {stats['total']}\n"
+        f"✅ Купили VIP: {stats['paid']}\n"
+        f"🎁 Бонус заработан: {stats['bonus_days_total']} дн.\n"
+        f"{month_line}\n\n"
+        f"📋 {hbold('Условия:')}\n"
+        f"• За каждого нового VIP-покупателя — +7 дней\n"
+        f"• Максимум 4 реферала в месяц (+30 дн.)\n"
+        f"• Бонус только за первую покупку реферала\n\n"
+        f"{hitalic('Скопируйте ссылку и отправьте другу 👆')}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Назад", callback_data="back_to_menu")],
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "back_to_menu")
+async def on_back_to_menu(callback: CallbackQuery):
+    _awaiting_input.pop(callback.from_user.id, None)
+    user   = await db.get_or_create_user(callback.from_user.id, callback.from_user.username)
+    is_vip = await db.is_vip(callback.from_user.id)
+    is_sup = await db.is_superuser(callback.from_user.id)
+
+    if not (is_vip or is_sup):
+        # User somehow ended up here without VIP — redirect to landing
+        await callback.message.edit_text(
+            f"{hbold('👋 Polymarket Signals')}\n\n"
+            f"Это бот торговых сигналов для Polymarket — "
+            f"платформы предсказательных рынков.\n\n"
+            f"Доступ к сигналам открывается после оформления подписки.",
+            reply_markup=get_landing_keyboard()
+        )
+        return
+
+    await callback.message.edit_text(
+        MAIN_MENU_TEXT,
+        reply_markup=get_main_menu_keyboard(user.signals_enabled, is_vip, is_sup)
+    )
+
+
+# ── Signal formatting ─────────────────────────────────────────────────────────
+
+async def format_signal_message(signal: Signal, total: int = 1) -> str:
+    days_label = ""
+    if signal.end_date:
+        try:
+            ed = str(signal.end_date).replace("Z", "").replace("+00:00", "")
+            dt = datetime.fromisoformat(ed)
+            days = (dt - datetime.utcnow()).total_seconds() / 86400
+            if days < 0:
+                days_label = "⏳ Истекает: скоро"
+            elif days < 1/24:
+                mins = max(1, int(days * 24 * 60))
+                days_label = f"⏳ Истекает через: {mins} мин."
+            elif days < 1:
+                hours = max(1, int(days * 24))
+                days_label = f"⏳ Истекает через: {hours} ч."
+            else:
+                days_label = f"⏳ Истекает через: {days:.1f} дн."
+        except Exception:
+            pass
+
+    conf_int = int(signal.confidence)
+
+    if signal.expected_outcome == "YES":
+        action = "Купить YES"
+    else:
+        action = "Купить NO"
+
+    msg = (
+        f"{signal.strategy}\n\n"
+        f"<code>{signal.market_name}</code>\n\n"
+        f"🎯 Позиция      {hbold(action)}\n"
+        f"💵 Вход         {signal.current_price:.0%}\n"
+        f"📈 Профит       +{signal.expected_profit:.1f}%\n"
+        f"🔥 Уверенность  {conf_int}%\n"
+    )
+
+    if days_label:
+        msg += f"⏳ Срок         {days_label.replace('⏳ ', '').replace('Истекает через: ', '')}\n"
+
+    reasoning = ""
+
+    if signal.strategy == "🔮 UMA Оракул":
+        days_left = signal.details.get("days_to_expiry", "?")
+        try:
+            days_float = float(days_left)
+            days_str = f"{days_float:.1f} дн." if days_float >= 1 else f"{int(days_float*24)} ч."
+        except Exception:
+            days_str = str(days_left)
+        if signal.expected_outcome == "YES":
+            reasoning = f"Исход «Да» предрешён — оракул UMA подтвердит через {days_str}."
+        else:
+            reasoning = f"Исход «Нет» предрешён — оракул UMA подтвердит через {days_str}."
+
+    elif signal.strategy == "📰 Новостной Анализ":
+        summary = signal.details.get("analysis_summary", "")
+        if summary:
+            reasoning = summary[:200]
+
+    elif signal.strategy == "🎯 Metaculus Консенсус":
+        meta_prob = signal.details.get("metaculus_probability", 0) * 100
+        poly_prob = signal.details.get("polymarket_probability", signal.current_price) * 100
+        div       = signal.details.get("divergence", 0) * 100
+        forecasters = signal.details.get("forecasters", 0)
+        fc_str = f" ({forecasters} прогнозистов)" if forecasters > 0 else ""
+        reasoning = f"Metaculus{fc_str}: {meta_prob:.0f}% vs рынок {poly_prob:.0f}% — расхождение {div:.0f}%."
+
+    if reasoning:
+        msg += f"\n{hitalic(reasoning)}"
+
+    return msg
+
+
+# ── Core signal delivery ──────────────────────────────────────────────────────
+
+async def check_signals_for_user(telegram_id: int):
+    """Fetch signals, apply user settings, send the best one, queue the rest."""
+    try:
+        is_vip  = await db.is_vip(telegram_id)
+        is_sup  = await db.is_superuser(telegram_id)
+        is_priv = is_vip or is_sup
+
+        s          = get_user_settings(telegram_id)
+        min_conf   = max(s["min_confidence"], 65 if is_priv else 80)
+        min_profit = s["min_profit"]
+        strat_map  = {
+            "uma":  "🔮 UMA Оракул",
+            "news": "📰 Новостной Анализ",
+            "meta": "🎯 Metaculus Консенсус",
+        }
+        allowed_strats = {strat_map[k] for k in s["strategies"]}
+
+        await bot.send_message(
+            telegram_id,
+            f"🔍 {hbold('Сканирую рынки...')} {'(VIP)' if is_priv else '(80%+)'}\n"
+            f"{hitalic(f'Фильтры: уверенность ≥{min_conf}% · профит ≥{min_profit:.0f}%')}"
+        )
+
+        signals = await signal_generator.generate_all_signals()
+
+        if not signals:
+            await bot.send_message(telegram_id, "ℹ️ Рынки не показывают возможностей прямо сейчас.")
+            return
+
+        user = await db.get_or_create_user(telegram_id=telegram_id)
+        valid: List[Signal] = []
+
+        for sig in signals:
+            if not sig.is_valid:
+                continue
+            if sig.strategy not in allowed_strats:
+                continue
+            if sig.confidence < min_conf:
+                continue
+            if sig.expected_profit < min_profit:
+                continue
+            already = await db.was_signal_sent(user.id, sig.market_id, sig.strategy, hours=6)
+            if already:
+                continue
+            valid.append(sig)
+
+        if not valid:
+            total_valid = len([s for s in signals if s.is_valid])
+            hint = " Попробуйте снизить пороги в ⚙️ Настройках." if total_valid > 0 else " Рынок спокойный."
+            back_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+                [InlineKeyboardButton(text="← Главное меню", callback_data="back_to_menu")],
+            ])
+            await bot.send_message(
+                telegram_id,
+                f"ℹ️ Новых сигналов по вашим фильтрам нет.{hint}",
+                reply_markup=back_kb
+            )
+            return
+
+        max_sig = s.get("max_signals", 3)
+        valid = valid[:max_sig]
+
+        _signal_queues[telegram_id] = list(valid[1:])
+        await send_signal_to_user(telegram_id, valid[0], is_priv, has_more=len(valid) > 1)
+
+    except Exception as e:
+        print(f"[ERR check_signals_for_user({telegram_id})] {e}")
+        import traceback; traceback.print_exc()
+        try:
+            await bot.send_message(telegram_id, "⚠️ Ошибка при сканировании. Попробуйте через минуту.")
+        except Exception:
+            pass
+
+
+async def send_signal_to_user(
+    telegram_id: int, signal: Signal, is_vip: bool = False, has_more: bool = False
+):
+    try:
+        msg_text = await format_signal_message(
+            signal,
+            total=len(_signal_queues.get(telegram_id, [])) + 1
+        )
+        if is_vip:
+            msg_text = f"💎 {hbold('VIP SIGNAL')}\n{msg_text}"
+
+        kb = get_signal_keyboard(signal.market_name, signal.source_url, has_more=has_more)
+
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=msg_text,
+            reply_markup=kb,
+            disable_web_page_preview=True
+        )
+
+        user = await db.get_or_create_user(telegram_id=telegram_id)
+        await db.record_signal_sent(user.id, signal.market_id, signal.strategy)
+
+    except Exception as e:
+        print(f"[ERR send_signal_to_user({telegram_id})] {e}")
+
+
+async def broadcast_signal(signal: Signal):
+    """Broadcast a signal to all eligible active users."""
+    users = await db.get_active_users()
+    sent  = 0
+
+    for user in users:
+        try:
+            is_user_vip = (
+                user.telegram_id == config.SUPERUSER_ID or
+                (user.vip_until and user.vip_until > datetime.now())
+            )
+            # Only VIP users receive broadcast signals
+            if not is_user_vip:
+                continue
+
+            s          = get_user_settings(user.telegram_id)
+            min_conf   = max(s["min_confidence"], 65)
+            min_profit = s["min_profit"]
+            strat_map  = {
+                "uma":  "🔮 UMA Оракул",
+                "news": "📰 Новостной Анализ",
+                "meta": "🎯 Metaculus Консенсус",
+            }
+            allowed_strats = {strat_map[k] for k in s["strategies"]}
+
+            if signal.strategy not in allowed_strats:
+                continue
+            if signal.confidence < min_conf:
+                continue
+            if signal.expected_profit < min_profit:
+                continue
+            if await db.was_signal_sent(user.id, signal.market_id, signal.strategy, hours=6):
+                continue
+
+            msg_text = await format_signal_message(signal)
+            msg_text = f"💎 {hbold('VIP SIGNAL')}\n{msg_text}"
+
+            kb = get_signal_keyboard(signal.market_name, signal.source_url, has_more=False)
+
+            await bot.send_message(
+                chat_id=user.telegram_id,
+                text=msg_text,
+                reply_markup=kb,
+                disable_web_page_preview=True
+            )
+            await db.record_signal_sent(user.id, signal.market_id, signal.strategy)
+            sent += 1
+            await asyncio.sleep(0.05)
+
+        except Exception as e:
+            print(f"[BROADCAST] Failed to send to {user.telegram_id}: {e}")
+
+    return sent
+
+
+# ── Background loop ───────────────────────────────────────────────────────────
+
+async def signal_check_loop():
+    """Background loop — checks pending payments and VIP expiry every 30 seconds."""
+    print("[LOOP] Background loop started (payment polling + VIP expiry)")
+    while True:
+        await _check_pending_payments()
+        await _check_vip_expiry()
+        await asyncio.sleep(30)
+
+
+async def _check_vip_expiry():
+    """Notify users whose VIP just expired and downgrade them to regular user."""
+    try:
+        expired_ids = await db.get_recently_expired_vip_users()
+        for telegram_id in expired_ids:
+            if telegram_id == config.SUPERUSER_ID:
+                continue
+            print(f"[VIP EXPIRY] Subscription expired for user {telegram_id}")
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Продлить подписку", callback_data="vip_info")],
+            ])
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    f"⏳ {hbold('Ваша VIP-подписка истекла')}\n\n"
+                    f"Доступ к эксклюзивным сигналам закрыт 🔒\n\n"
+                    f"Продлите подписку, чтобы снова получать точные сигналы "
+                    f"с Polymarket и быть на шаг впереди рынка 📊",
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                print(f"[VIP EXPIRY] Failed to notify {telegram_id}: {e}")
+    except Exception as e:
+        print(f"[VIP EXPIRY] Error in expiry check: {e}")
+
+
+async def _check_pending_payments():
+    """Auto-activates VIP for paid invoices."""
+    pending = get_all_pending_invoices()
+    if not pending:
+        return
+
+    for invoice_id, data in list(pending.items()):
+        try:
+            age = (datetime.now() - data["created_at"]).total_seconds()
+            if age > 7200:
+                remove_pending_invoice(invoice_id)
+                continue
+
+            status = await get_invoice_status(invoice_id)
+
+            if status == "paid":
+                telegram_id = data["telegram_id"]
+                days = data["days"]
+                plan_key = data["plan_key"]
+
+                success = await db.add_vip(telegram_id, config.SUPERUSER_ID, days)
+                remove_pending_invoice(invoice_id)
+
+                if success:
+                    days_label = VIP_PLANS.get(plan_key, (days, 0, f"{days} дней"))[2]
+                    print(f"[PAYMENT] VIP activated: user={telegram_id}, days={days}")
+                    try:
+                        await bot.send_message(
+                            telegram_id,
+                            f"🎉 {hbold('Оплата получена! Доступ открыт!')}\n\n"
+                            f"✅ Тариф: {days_label} ({days} дней)\n\n"
+                            f"Нажмите /start чтобы войти в бота.",
+                        )
+                    except Exception as e:
+                        print(f"[PAYMENT] Notification failed for {telegram_id}: {e}")
+
+                    # ── Referral bonus ────────────────────────────────────────
+                    referrer_id = await db.get_referrer(telegram_id)
+                    if referrer_id and referrer_id != config.SUPERUSER_ID:
+                        bonus_granted = await db.pay_referral_bonus(referrer_id, telegram_id)
+                        if bonus_granted:
+                            print(f"[REFERRAL] Bonus: referrer={referrer_id}, referred={telegram_id}")
+                            try:
+                                await bot.send_message(
+                                    referrer_id,
+                                    f"🎁 {hbold('+7 дней к подписке!')}\n\n"
+                                    f"Ваш реферал оформил VIP — бонус начислен автоматически.\n\n"
+                                    f"Приводите ещё! /start → 👥 Реферальная программа"
+                                )
+                            except Exception:
+                                pass
+
+                    if telegram_id != config.SUPERUSER_ID:
+                        try:
+                            await bot.send_message(
+                                config.SUPERUSER_ID,
+                                f"💰 {hbold('Новая оплата!')}\n\n"
+                                f"👤 User ID: <code>{telegram_id}</code>\n"
+                                f"📦 Тариф: {days_label} ({days} дней)\n"
+                                f"🧾 Invoice: {invoice_id}"
+                            )
+                        except Exception:
+                            pass
+
+            elif status == "expired":
+                remove_pending_invoice(invoice_id)
+
+        except Exception as e:
+            print(f"[PAYMENT POLL] Error for invoice {invoice_id}: {e}")
+
+
+# ── Superuser management panel ────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "su_manage")
+async def on_su_manage(callback: CallbackQuery):
+    if callback.from_user.id != config.SUPERUSER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        f"👑 {hbold('Панель управления')}\\n\\n"
+        f"Выберите действие:",
+        reply_markup=get_su_manage_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "su_add_vip")
+async def on_su_add_vip(callback: CallbackQuery):
+    if callback.from_user.id != config.SUPERUSER_ID:
+        await callback.answer("❌", show_alert=True)
+        return
+    _awaiting_input[callback.from_user.id] = "su_add_vip"
+    await callback.answer()
+    await callback.message.answer(
+        "➕ Выдать VIP\n\n"
+        "Введите: <code>@username days</code>\n"
+        "Например: <code>@username 30</code>"
+    )
+
+
+@dp.callback_query(F.data == "su_remove_vip")
+async def on_su_remove_vip(callback: CallbackQuery):
+    if callback.from_user.id != config.SUPERUSER_ID:
+        await callback.answer("❌", show_alert=True)
+        return
+    _awaiting_input[callback.from_user.id] = "su_remove_vip"
+    await callback.answer()
+    await callback.message.answer(
+        "➖ Убрать VIP\n\n"
+        "Введите username пользователя:\n"
+        "Например: <code>@username</code>"
+    )
+
+
+@dp.callback_query(F.data == "su_add_admin")
+async def on_su_add_admin(callback: CallbackQuery):
+    if callback.from_user.id != config.SUPERUSER_ID:
+        await callback.answer("❌", show_alert=True)
+        return
+    _awaiting_input[callback.from_user.id] = "su_add_admin"
+    await callback.answer()
+    await callback.message.answer(
+        "🛡 Выдать права Admin\n\n"
+        "Введите username:\n"
+        "Например: <code>@username</code>"
+    )
+
+
+@dp.callback_query(F.data == "su_remove_admin")
+async def on_su_remove_admin(callback: CallbackQuery):
+    if callback.from_user.id != config.SUPERUSER_ID:
+        await callback.answer("❌", show_alert=True)
+        return
+    _awaiting_input[callback.from_user.id] = "su_remove_admin"
+    await callback.answer()
+    await callback.message.answer(
+        "🚫 Убрать Admin\n\n"
+        "Введите username:\n"
+        "Например: <code>@username</code>"
+    )
+
+
+@dp.callback_query(F.data == "su_list_vip")
+async def on_su_list_vip(callback: CallbackQuery):
+    if callback.from_user.id != config.SUPERUSER_ID:
+        await callback.answer("❌", show_alert=True)
+        return
+    await callback.answer()
+    vip_users = await db.get_vip_users()
+    if not vip_users:
+        text = f"📋 {hbold('VIP пользователи')}\\n\\nНет активных VIP."
+    else:
+        lines = [f"📋 {hbold(f'VIP пользователей: {len(vip_users)}')}\\n"]
+        for u in vip_users:
+            days_left = (u.vip_until - datetime.now()).days if u.vip_until else 0
+            uname = f"@{u.username}" if u.username else str(u.telegram_id)
+            lines.append(f"• {uname} (<code>{u.telegram_id}</code>) — {days_left} дн.")
+        text = "\\n".join(lines)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Назад", callback_data="su_manage")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+async def _handle_su_text_input(message: Message, input_type: str):
+    """Process superuser text inputs for user management."""
+    uid = message.from_user.id
+    text = message.text.strip()
+
+    async def resolve_username(raw: str) -> Optional[int]:
+        """Resolve @username or plain username to telegram_id."""
+        tid = await db.get_telegram_id_by_username(raw)
+        return tid
+
+    if input_type == "su_add_vip":
+        parts = text.split()
+        if len(parts) != 2:
+            _awaiting_input[uid] = input_type
+            await message.answer("❌ Введите: <code>@username days</code>\nНапример: <code>@username 30</code>")
+            return
+        username_raw, days_raw = parts
+        try:
+            days = int(days_raw)
+        except ValueError:
+            _awaiting_input[uid] = input_type
+            await message.answer("❌ Количество дней должно быть числом. Попробуйте снова.")
+            return
+
+        target_id = await resolve_username(username_raw)
+        if not target_id:
+            await message.answer(f"❌ Пользователь <code>{username_raw}</code> не найден.\nОн должен написать /start боту.")
+            return
+
+        success = await db.add_vip(target_id, uid, days)
+        if success:
+            await message.answer(f"✅ VIP выдан: {username_raw} на {days} дн.")
+            try:
+                await bot.send_message(
+                    target_id,
+                    f"🎉 {hbold('Вам выдан VIP доступ!')}\n\n"
+                    f"Срок: {days} дней\n"
+                    f"Используйте /start для обновления меню."
+                )
+            except Exception:
+                pass
+        else:
+            await message.answer(f"❌ Не удалось выдать VIP пользователю {username_raw}.")
+
+    elif input_type == "su_remove_vip":
+        target_id = await resolve_username(text)
+        if not target_id:
+            await message.answer(f"❌ Пользователь <code>{text}</code> не найден.\nОн должен написать /start боту.")
+            return
+        success = await db.remove_vip(target_id)
+        if success:
+            await message.answer(f"✅ VIP убран у пользователя {text}")
+        else:
+            await message.answer(f"❌ Не удалось. Пользователь {text} не найден.")
+
+    elif input_type == "su_add_admin":
+        target_id = await resolve_username(text)
+        if not target_id:
+            await message.answer(f"❌ Пользователь <code>{text}</code> не найден.\nОн должен написать /start боту.")
+            return
+        success = await db.add_admin(target_id)
+        if target_id not in config.ADMIN_IDS:
+            config.ADMIN_IDS.append(target_id)
+        if success:
+            await message.answer(f"✅ Admin выдан: {text} (<code>{target_id}</code>)")
+        else:
+            await message.answer(f"❌ Ошибка при добавлении.")
+
+    elif input_type == "su_remove_admin":
+        target_id = await resolve_username(text)
+        if not target_id:
+            await message.answer(f"❌ Пользователь <code>{text}</code> не найден.")
+            return
+        if target_id == config.SUPERUSER_ID:
+            await message.answer("❌ Нельзя убрать права Superuser.")
+            return
+        success = await db.remove_admin(target_id)
+        if target_id in config.ADMIN_IDS:
+            config.ADMIN_IDS.remove(target_id)
+        if success:
+            await message.answer(f"✅ Admin убран у {text}")
+        else:
+            await message.answer(f"❌ Ошибка.")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Управление", callback_data="su_manage")]
+    ])
+    await message.answer("Вернуться в панель:", reply_markup=kb)
+
+
+# ── Startup / Shutdown ────────────────────────────────────────────────────────
+
+async def on_startup(bot: Bot):
+    await db.init()
+    print("Bot started and database initialized!")
+
+
+async def on_shutdown(bot: Bot):
+    print("Bot shutting down...")
