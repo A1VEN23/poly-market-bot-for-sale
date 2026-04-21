@@ -240,6 +240,24 @@ class Database:
 
     # ── Universal query helpers ────────────────────────────────────────────────
 
+    @staticmethod
+    def _pg_params(params: tuple) -> tuple:
+        """
+        Convert params for asyncpg.
+        asyncpg требует datetime объекты, а не ISO-строки.
+        Все строки вида '2026-04-21T...' автоматически парсятся в datetime.
+        """
+        result = []
+        for p in params:
+            if isinstance(p, str):
+                try:
+                    result.append(datetime.fromisoformat(p))
+                    continue
+                except (ValueError, TypeError):
+                    pass
+            result.append(p)
+        return tuple(result)
+
     async def _execute(self, sql: str, params: tuple = (), fetch: str = None):
         """
         Run a SQL query on SQLite or PostgreSQL.
@@ -253,20 +271,21 @@ class Database:
             while '?' in pg_sql:
                 idx += 1
                 pg_sql = pg_sql.replace('?', f'${idx}', 1)
-            # Convert AUTOINCREMENT → (not needed in PG, SERIAL handles it)
+            # Convert ISO string params to datetime objects for asyncpg
+            pg_params = self._pg_params(params)
             pool = await self._get_pg_pool()
             async with pool.acquire() as conn:
                 if fetch == 'one':
-                    row = await conn.fetchrow(pg_sql, *params)
+                    row = await conn.fetchrow(pg_sql, *pg_params)
                     return dict(row) if row else None
                 elif fetch == 'all':
-                    rows = await conn.fetch(pg_sql, *params)
+                    rows = await conn.fetch(pg_sql, *pg_params)
                     return [dict(r) for r in rows]
                 elif fetch == 'lastid':
-                    row = await conn.fetchrow(pg_sql + ' RETURNING id', *params)
+                    row = await conn.fetchrow(pg_sql + ' RETURNING id', *pg_params)
                     return row['id'] if row else None
                 else:
-                    await conn.execute(pg_sql, *params)
+                    await conn.execute(pg_sql, *pg_params)
                     return None
         else:
             async with aiosqlite.connect(self.db_path) as db:
@@ -501,22 +520,13 @@ class Database:
         now = datetime.now()
         window_start = (now - timedelta(minutes=10)).isoformat()
         window_end = now.isoformat()
-        if _USE_POSTGRES:
-            rows = await self._execute(
-                """SELECT telegram_id FROM users
-                   WHERE vip_until IS NOT NULL
-                     AND vip_until > ?::timestamp
-                     AND vip_until <= ?::timestamp""",
-                (window_start, window_end), fetch='all'
-            )
-        else:
-            rows = await self._execute(
-                """SELECT telegram_id FROM users
-                   WHERE vip_until IS NOT NULL
-                     AND vip_until > ?
-                     AND vip_until <= ?""",
-                (window_start, window_end), fetch='all'
-            )
+        rows = await self._execute(
+            """SELECT telegram_id FROM users
+               WHERE vip_until IS NOT NULL
+                 AND vip_until > ?
+                 AND vip_until <= ?""",
+            (window_start, window_end), fetch='all'
+        )
         return [r["telegram_id"] for r in (rows or [])]
 
     async def remove_vip(self, telegram_id: int) -> bool:
