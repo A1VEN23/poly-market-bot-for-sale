@@ -241,11 +241,10 @@ class Database:
     # ── Universal query helpers ────────────────────────────────────────────────
 
     @staticmethod
-    def _pg_params(params: tuple) -> tuple:
+    def _fix_pg_params(params: tuple) -> tuple:
         """
-        Convert params for asyncpg.
-        asyncpg требует datetime объекты, а не ISO-строки.
-        Все строки вида '2026-04-21T...' автоматически парсятся в datetime.
+        asyncpg не принимает ISO-строки как datetime — конвертируем автоматически.
+        Все строки вида '2026-04-21T...' парсятся в datetime объекты.
         """
         result = []
         for p in params:
@@ -271,8 +270,8 @@ class Database:
             while '?' in pg_sql:
                 idx += 1
                 pg_sql = pg_sql.replace('?', f'${idx}', 1)
-            # Convert ISO string params to datetime objects for asyncpg
-            pg_params = self._pg_params(params)
+            # asyncpg требует datetime объекты, не строки — конвертируем
+            pg_params = self._fix_pg_params(params)
             pool = await self._get_pg_pool()
             async with pool.acquire() as conn:
                 if fetch == 'one':
@@ -421,7 +420,7 @@ class Database:
         new_vip_until = current_vip_dt + timedelta(days=days)
         await self._execute(
             "UPDATE users SET vip_until = ? WHERE id = ?",
-            (new_vip_until.isoformat(), user_id)
+            (new_vip_until, user_id)
         )
         await self._execute(
             "INSERT INTO vip_transactions (user_id, admin_id, days_added) VALUES (?, ?, ?)",
@@ -518,8 +517,8 @@ class Database:
 
     async def get_recently_expired_vip_users(self) -> List[int]:
         now = datetime.now()
-        window_start = (now - timedelta(minutes=10)).isoformat()
-        window_end = now.isoformat()
+        window_start = now - timedelta(minutes=10)
+        window_end = now
         rows = await self._execute(
             """SELECT telegram_id FROM users
                WHERE vip_until IS NOT NULL
@@ -579,7 +578,7 @@ class Database:
         )
 
     async def was_signal_sent(self, user_id: int, market_id: str, strategy: str, hours: int = 24) -> bool:
-        since = (datetime.now() - timedelta(hours=hours)).isoformat()
+        since = datetime.now() - timedelta(hours=hours)
         row = await self._execute(
             """SELECT 1 FROM sent_signals
                WHERE user_id = ? AND market_id = ? AND strategy = ?
@@ -607,7 +606,7 @@ class Database:
         )
 
     async def get_signal_stats(self, days: int = 30) -> Dict[str, Any]:
-        since = (datetime.now() - timedelta(days=days)).isoformat()
+        since = datetime.now() - timedelta(days=days)
         rows = await self._execute(
             """SELECT COUNT(*) as total,
                       SUM(CASE WHEN outcome_verified = 1 THEN 1 ELSE 0 END) as verified,
@@ -671,7 +670,7 @@ class Database:
         row = await self._execute(
             """SELECT COUNT(*) as cnt FROM referrals
                WHERE referrer_telegram_id = ? AND bonus_paid = 1 AND created_at >= ?""",
-            (referrer_telegram_id, month_start.isoformat()), fetch='one'
+            (referrer_telegram_id, month_start), fetch='one'
         )
         paid_this_month = row["cnt"] if row else 0
 
@@ -702,7 +701,7 @@ class Database:
         row = await self._execute(
             """SELECT COUNT(*) as cnt FROM referrals
                WHERE referrer_telegram_id = ? AND bonus_paid = 1 AND created_at >= ?""",
-            (referrer_telegram_id, month_start.isoformat()), fetch='one'
+            (referrer_telegram_id, month_start), fetch='one'
         )
         paid_this_month = row["cnt"] if row else 0
 
