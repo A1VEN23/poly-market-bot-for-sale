@@ -521,9 +521,9 @@ class UMAOracleStrategy:
     Expected winrate: ~90%+
     """
 
-    EXPIRY_DAYS_MAX = 5.0        # ≤5 days — fast resolution only
-    PRICE_HIGH_THRESHOLD = 0.82  # YES ≥ 82% → strong YES signal
-    PRICE_LOW_THRESHOLD  = 0.18  # YES ≤ 18% → strong NO signal
+    EXPIRY_DAYS_MAX = 3.0        # ≤3 days — быстрые сигналы только
+    PRICE_HIGH_THRESHOLD = 0.70  # YES ≥ 70% → сигнал YES (больше рынков)
+    PRICE_LOW_THRESHOLD  = 0.30  # YES ≤ 30% → сигнал NO (больше рынков)
     MIN_VOLUME = 200             # Lower volume floor for more coverage
 
     def __init__(self):
@@ -581,25 +581,29 @@ class UMAOracleStrategy:
 
                 if price >= self.PRICE_HIGH_THRESHOLD:
                     expected_outcome = "YES"
-                    # Confidence scales with price: 82%→75conf, 90%→87conf, 99%→95conf
+                    # Confidence scales with price: 70%→62conf, 82%→78conf, 90%→88conf, 99%→95conf
                     if price >= 0.90:
                         raw_conf = 85 + (price - 0.90) / 0.10 * 10
-                    elif price >= 0.85:
-                        raw_conf = 78 + (price - 0.85) / 0.05 * 7
+                    elif price >= 0.82:
+                        raw_conf = 78 + (price - 0.82) / 0.08 * 7
+                    elif price >= 0.75:
+                        raw_conf = 70 + (price - 0.75) / 0.07 * 8
                     else:
-                        raw_conf = 72 + (price - self.PRICE_HIGH_THRESHOLD) / (0.85 - self.PRICE_HIGH_THRESHOLD) * 6
+                        raw_conf = 62 + (price - self.PRICE_HIGH_THRESHOLD) / (0.75 - self.PRICE_HIGH_THRESHOLD) * 8
                     confidence = min(raw_conf, 95)
                     expected_profit = _calc_roi(price, "YES")
 
                 elif price <= self.PRICE_LOW_THRESHOLD:
                     expected_outcome = "NO"
-                    # Mirror
+                    # Mirror: 30%→62conf, 18%→78conf, 10%→88conf
                     if price <= 0.10:
                         raw_conf = 85 + (0.10 - price) / 0.10 * 10
-                    elif price <= 0.15:
-                        raw_conf = 78 + (0.15 - price) / 0.05 * 7
+                    elif price <= 0.18:
+                        raw_conf = 78 + (0.18 - price) / 0.08 * 7
+                    elif price <= 0.25:
+                        raw_conf = 70 + (0.25 - price) / 0.07 * 8
                     else:
-                        raw_conf = 72 + (self.PRICE_LOW_THRESHOLD - price) / (self.PRICE_LOW_THRESHOLD - 0.15) * 6
+                        raw_conf = 62 + (self.PRICE_LOW_THRESHOLD - price) / (self.PRICE_LOW_THRESHOLD - 0.25) * 8
                     confidence = min(raw_conf, 95)
                     expected_profit = _calc_roi(price, "NO")
 
@@ -721,9 +725,9 @@ class NewsStrategy:
             price = liq["best_bid"]
             if price > 0.95 or price < 0.05:
                 continue
-            # Prioritise near-expiry markets — news is most actionable there
+            # Приоритет — рынки истекающие в течение 3 дней
             days = m.get("days_to_expiry")
-            if days is not None and days > 14:
+            if days is not None and days > 3:
                 continue
             m["_liq"] = liq
             tradeable.append(m)
@@ -734,10 +738,10 @@ class NewsStrategy:
             -x.get("volume_24h", 0)
         ))
 
-        print(f"[📰 NEWS] Tradeable markets (≤14d): {len(tradeable)} — batch analysis (top 25)")
+        print(f"[📰 NEWS] Tradeable markets (≤3d): {len(tradeable)} — batch analysis (top 40)")
 
         # BATCH mode: single AI call for all markets → avoids Groq 429 floods
-        batch_results = await self._analyze_batch(tradeable[:25], headlines)
+        batch_results = await self._analyze_batch(tradeable[:40], headlines)
         print(f"[📰 NEWS] Batch returned {len(batch_results)} relevant markets")
 
         for market, analysis in batch_results:
@@ -941,9 +945,9 @@ class MetaculusStrategy:
                     continue
                 if liq["spread_pct"] > config.MAX_SPREAD_PERCENT:
                     continue
-                # Only near-expiry markets — signals must be actionable fast
+                # Только быстрые рынки — сигналы должны быть actioable за 1-3 дня
                 days = m.get("days_to_expiry")
-                if days is None or days > 14:
+                if days is None or days > 3:
                     continue
                 # Skip markets priced near 0 or 1 — already efficient
                 price = liq["best_bid"]
@@ -1415,7 +1419,7 @@ class OrderBookStrategy:
     GAMMA_API      = "https://gamma-api.polymarket.com"
     MIN_ORDER_SIZE = 100    # $100+ orders count as significant
     MIN_IMBALANCE  = 0.55   # 55%+ lean = signal (was 60% — too strict)
-    EXPIRY_DAYS_MAX = 14    # ≤14 days — wider window for more candidates
+    EXPIRY_DAYS_MAX = 3     # ≤3 дней — только быстрые сигналы
     MIN_VOLUME     = 300    # Lower volume floor for more coverage
 
     async def get_signals(self) -> List[Signal]:
@@ -1434,7 +1438,7 @@ class OrderBookStrategy:
             print(f"[📊 ORDERBOOK] Candidates: {len(candidates)} (≤{self.EXPIRY_DAYS_MAX}d expiry)")
 
             checked = 0
-            for market in candidates[:80]:
+            for market in candidates[:150]:
                 liq = LiquidityFilter.check(market)
                 if not liq or liq["volume_24h"] < self.MIN_VOLUME:
                     continue
@@ -1627,7 +1631,7 @@ class GrokSentimentStrategy:
 
     GROK_LIVE_URL = "https://api.x.ai/v1/chat/completions"
     MIN_VOLUME    = 500     # Lower threshold — include more markets
-    MAX_MARKETS   = 20      # Analyze more markets per batch
+    MAX_MARKETS   = 40      # Больше рынков в батче для большего числа сигналов
 
     async def get_signals(self) -> List[Signal]:
         signals: List[Signal] = []
@@ -1645,15 +1649,15 @@ class GrokSentimentStrategy:
         try:
             all_markets = await fetch_all_polymarket_markets_cached()
 
-            # Target: markets expiring in ≤14 days — sorted soonest first
+            # Цель: рынки истекающие в ≤3 дня — только быстрые сигналы
             targets = [
                 m for m in all_markets
                 if m.get("volume_24h", 0) >= self.MIN_VOLUME
                 and m.get("days_to_expiry") is not None
-                and 0 < m["days_to_expiry"] <= 14
+                and 0 < m["days_to_expiry"] <= 3
             ]
             targets.sort(key=lambda x: (x.get("days_to_expiry", 999), -x.get("volume_24h", 0)))
-            print(f"[🐦 SENTIMENT] Targets (≤14d, vol≥{self.MIN_VOLUME}): {len(targets)}")
+            print(f"[🐦 SENTIMENT] Targets (≤3d, vol≥{self.MIN_VOLUME}): {len(targets)}")
 
             # ONE batch AI call for all targets — no per-market rate limit issues
             signals = await self._batch_sentiment_signals(targets[:self.MAX_MARKETS])
@@ -1927,7 +1931,7 @@ class OfficialDataStrategy:
                     continue
 
                 days = market.get("days_to_expiry")
-                if days is None or days > 14:
+                if days is None or days > 3:
                     continue
 
                 liq   = market["_liq"]
