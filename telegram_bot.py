@@ -57,6 +57,7 @@ DEFAULT_SETTINGS = {
     "strategies": {"uma", "news", "meta", "orderbook", "xsent", "official"},
     "max_signals": 3,
     "topics": {"crypto", "politics", "sports", "economics", "science", "general"},
+    "multi_mode": False,
 }
 
 STRATEGY_LABELS = {
@@ -120,6 +121,8 @@ def get_user_settings(telegram_id: int) -> Dict:
     s = _user_settings[telegram_id]
     if "topics" not in s:
         s["topics"] = set(DEFAULT_SETTINGS["topics"])
+    if "multi_mode" not in s:
+        s["multi_mode"] = False
     # Back-compat: add new strategy keys for existing sessions
     if "orderbook" not in s["strategies"] and "uma" in s["strategies"]:
         s["strategies"].update({"orderbook", "xsent", "official"})
@@ -436,6 +439,15 @@ def get_settings_keyboard(telegram_id: int, is_vip: bool) -> InlineKeyboardMarku
         rows.append(row_btns)
 
     rows.append([InlineKeyboardButton(text="← Назад к настройкам", callback_data="settings")])
+
+    # ── Multi mode toggle ─────────────────────────────────────────────────────
+    multi_on = s.get("multi_mode", False)
+    multi_icon = "✅" if multi_on else "⬜️"
+    multi_label = "ВКЛ — все сигналы по кнопке" if multi_on else "ВЫКЛ — лучший сигнал сразу"
+    rows.insert(-1, [InlineKeyboardButton(
+        text=f"{multi_icon} 🔢 Мульти-режим: {multi_label}",
+        callback_data="toggle_multi_mode"
+    )])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -760,7 +772,24 @@ async def on_next_signal(callback: CallbackQuery):
     await callback.answer("📤 Следующий сигнал...")
     signal = queue.pop(0)
     _signal_queues[uid] = queue
-    await send_signal_to_user(uid, signal, is_vip or is_sup, has_more=bool(queue))
+
+    s = get_user_settings(uid)
+    multi_mode = s.get("multi_mode", False)
+
+    if multi_mode:
+        # Считаем номер текущего сигнала по размеру очереди
+        max_sig = s.get("max_signals", 3)
+        remaining = len(queue)
+        signal_num = max_sig - remaining  # номер этого сигнала
+        await send_signal_to_user(
+            uid, signal, is_vip or is_sup,
+            has_more=bool(queue),
+            multi_mode=True,
+            signal_num=signal_num,
+            total_signals=max_sig,
+        )
+    else:
+        await send_signal_to_user(uid, signal, is_vip or is_sup, has_more=bool(queue))
 
 
 # ── Settings handlers ──────────────────────────────────────────────────────────
@@ -882,11 +911,13 @@ async def on_settings_advanced(callback: CallbackQuery):
     topics_text = " · ".join(TOPIC_LABELS[k] for k in s["topics"]) or "нет"
     mp = f"{s['min_profit']:.0f}%"
     mc = f"{s['min_confidence']}%"
+    multi_label = "✅ ВКЛ" if s.get("multi_mode") else "⬜️ ВЫКЛ"
     text = (
         f"{hbold('🔬 Продвинутые настройки')}\n\n"
         f"📈 Мин. ROI (профит): {hbold(mp)}\n"
         f"🎯 Мин. уверенность: {hbold(mc)}\n"
         f"📦 Сигналов за раз: {hbold(str(s['max_signals']))}\n"
+        f"🔢 Мульти-режим: {hbold(multi_label)}\n"
         f"📡 Стратегии ({len(s['strategies'])}/6): {strats_text}\n"
         f"🗂 Темы: {topics_text}\n\n"
         f"{hitalic('Нажмите кнопку чтобы изменить:')}"
@@ -898,6 +929,19 @@ async def on_settings_advanced(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "toggle_multi_mode")
+async def on_toggle_multi_mode(callback: CallbackQuery):
+    is_vip = await db.is_vip(callback.from_user.id)
+    is_sup = await db.is_superuser(callback.from_user.id)
+    uid = callback.from_user.id
+    s = get_user_settings(uid)
+    s["multi_mode"] = not s.get("multi_mode", False)
+    await persist_user_settings(uid)
+    status = "✅ включён" if s["multi_mode"] else "⬜️ выключен"
+    await callback.answer(f"🔢 Мульти-режим {status}", show_alert=False)
+    await _refresh_settings_message(callback, is_vip or is_sup)
+
+
 async def _refresh_settings_message(callback: CallbackQuery, is_vip: bool):
     uid = callback.from_user.id
     s = get_user_settings(uid)
@@ -905,11 +949,13 @@ async def _refresh_settings_message(callback: CallbackQuery, is_vip: bool):
     topics_text = " · ".join(TOPIC_LABELS[k] for k in s["topics"]) or "нет"
     mp = f"{s['min_profit']:.0f}%"
     mc = f"{s['min_confidence']}%"
+    multi_label = "✅ ВКЛ" if s.get("multi_mode") else "⬜️ ВЫКЛ"
     await callback.message.edit_text(
         f"{hbold('🔬 Продвинутые настройки')}\n\n"
         f"📈 Мин. ROI (профит): {hbold(mp)}\n"
         f"🎯 Мин. уверенность: {hbold(mc)}\n"
         f"📦 Сигналов за раз: {hbold(str(s['max_signals']))}\n"
+        f"🔢 Мульти-режим: {hbold(multi_label)}\n"
         f"📡 Стратегии ({len(s['strategies'])}/6): {strats_text}\n"
         f"🗂 Темы: {topics_text}\n\n"
         f"{hitalic('Нажмите кнопку чтобы изменить:')}",
@@ -1781,6 +1827,11 @@ async def check_signals_for_user(telegram_id: int):
             return
 
         max_sig = s.get("max_signals", 3)
+        multi_mode = s.get("multi_mode", False)
+
+        # В мульти-режиме берём ВСЕ подходящие сигналы (до max_signals),
+        # кладём их в очередь и шлём первый + кнопку "Следующий сигнал"
+        # В обычном режиме — отправляем сразу все пачкой (старое поведение)
 
         # Sort by soonest expiry first, then by highest confidence
         from logic import _days_sort_key_str
@@ -1790,8 +1841,21 @@ async def check_signals_for_user(telegram_id: int):
         ))
         valid = valid[:max_sig]
 
-        _signal_queues[telegram_id] = list(valid[1:])
-        await send_signal_to_user(telegram_id, valid[0], is_priv, has_more=len(valid) > 1)
+        if multi_mode:
+            # Мульти-режим: первый сигнал + очередь остальных
+            _signal_queues[telegram_id] = list(valid[1:])
+            total_found = len(valid)
+            await send_signal_to_user(
+                telegram_id, valid[0], is_priv,
+                has_more=len(valid) > 1,
+                multi_mode=True,
+                signal_num=1,
+                total_signals=total_found,
+            )
+        else:
+            # Обычный режим: первый сигнал + кнопка "Другой сигнал" если есть ещё
+            _signal_queues[telegram_id] = list(valid[1:])
+            await send_signal_to_user(telegram_id, valid[0], is_priv, has_more=len(valid) > 1)
 
     except Exception as e:
         print(f"[ERR check_signals_for_user({telegram_id})] {e}")
@@ -1811,15 +1875,24 @@ async def check_signals_for_user(telegram_id: int):
 
 
 async def send_signal_to_user(
-    telegram_id: int, signal: Signal, is_vip: bool = False, has_more: bool = False
+    telegram_id: int, signal: Signal, is_vip: bool = False, has_more: bool = False,
+    multi_mode: bool = False, signal_num: int = 1, total_signals: int = 1,
 ):
     try:
         msg_text = await format_signal_message(
             signal,
             total=len(_signal_queues.get(telegram_id, [])) + 1
         )
-        if is_vip:
+
+        if multi_mode and total_signals > 1:
+            # Шапка с прогрессом: "Сигнал 1 из 5"
+            progress = f"🔢 {hbold(f'Сигнал {signal_num} из {total_signals}')}\n"
+            msg_text = f"{progress}{msg_text}"
+        elif is_vip:
             msg_text = f"💎 {hbold('VIP SIGNAL')}\n{msg_text}"
+
+        if is_vip and (multi_mode and total_signals > 1):
+            msg_text = f"💎 {hbold('VIP')} · {msg_text}"
 
         kb = get_signal_keyboard(
             signal.market_name,
