@@ -18,7 +18,7 @@ class Config:
     # ── Liquidity & signal filters ────────────────────────────────────────────
     MIN_VOLUME_24H: float = float(os.getenv("MIN_VOLUME_24H", "1000"))
     MAX_SPREAD_PERCENT: float = float(os.getenv("MAX_SPREAD_PERCENT", "30.0"))
-    MIN_PROFIT_PERCENT: float = float(os.getenv("MIN_PROFIT_PERCENT", "3.0"))
+    MIN_PROFIT_PERCENT: float = float(os.getenv("MIN_PROFIT_PERCENT", "1.5"))
 
     # ── Superuser — always has VIP ────────────────────────────────────────────
     SUPERUSER_ID: int = 1192740493
