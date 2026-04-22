@@ -61,6 +61,26 @@ async def lifespan(application: FastAPI):
     _bot_task = asyncio.create_task(_bot_main())
     print("[MAIN] Telegram bot task started")
 
+    # ── Self-ping loop: keeps Render awake every 10 minutes ─────────────────
+    async def _keep_alive():
+        import aiohttp
+        url = os.getenv("RENDER_EXTERNAL_URL", "")
+        if not url:
+            print("[KEEP-ALIVE] RENDER_EXTERNAL_URL not set, skipping self-ping")
+            return
+        ping_url = url.rstrip("/") + "/ping"
+        print(f"[KEEP-ALIVE] Self-ping started → {ping_url}")
+        while True:
+            await asyncio.sleep(10 * 60)  # every 10 minutes
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(ping_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        print(f"[KEEP-ALIVE] ping {r.status}")
+            except Exception as e:
+                print(f"[KEEP-ALIVE] ping failed: {e}")
+
+    asyncio.create_task(_keep_alive())
+
     yield  # FastAPI is running
 
     # Shutdown
@@ -85,6 +105,12 @@ async def health(request: Request):
 @app.head("/")
 async def health_head(request: Request):
     return Response(status_code=200)
+
+
+@app.get("/ping")
+async def ping():
+    """Lightweight endpoint for UptimeRobot — responds instantly."""
+    return Response(content="pong", media_type="text/plain")
 
 
 @app.get("/health")
